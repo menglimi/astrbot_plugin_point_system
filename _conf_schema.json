@@ -14,13 +14,13 @@
   "sign_in_trigger_keyword": {
     "description": "无前缀签到触发关键词",
     "type": "string",
-    "hint": "例如填“星缘”后，用户可直接发送“星缘签到”或“签到星缘”进行签到。",
+    "hint": "例如填“群名简称”后，用户可直接发送“关键词+签到”或“签到+关键词”进行签到。",
     "default": "星缘"
   },
   "lottery_trigger_keyword": {
     "description": "无前缀抽奖触发关键词",
     "type": "string",
-    "hint": "例如填“星缘”后，用户可直接发送“星缘抽奖”或“抽奖星缘”参与默认模式抽奖。",
+    "hint": "例如填“群名简称”后，用户可直接发送“关键词+抽奖”或“抽奖+关键词”参与默认模式抽奖。",
     "default": "星缘"
   },
   "sign_in_settings": {
@@ -158,6 +158,48 @@
         "type": "int",
         "hint": "消息纯文本少于该长度时，不计入活跃奖励。",
         "default": 4
+      }
+    }
+  },
+  "birthday_settings": {
+    "description": "生日功能设置",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "是否开启生日功能",
+        "type": "bool",
+        "hint": "关闭后将停用生日签到、生日奖励和定时寿星播报。",
+        "default": true
+      },
+      "sign_in_trigger": {
+        "description": "生日签到触发词",
+        "type": "string",
+        "hint": "用户发送该文本时触发生日签到，例如“生日签到”。",
+        "default": "生日签到"
+      },
+      "reward_points": {
+        "description": "生日签到奖励积分",
+        "type": "int",
+        "hint": "生日签到成功时奖励多少积分。",
+        "default": 50
+      },
+      "auto_record_when_unset": {
+        "description": "未记录生日时自动记录今天",
+        "type": "bool",
+        "hint": "开启后，用户首次使用生日签到时，会自动把当天记为生日。",
+        "default": true
+      },
+      "auto_broadcast_enabled": {
+        "description": "是否开启生日名单播报",
+        "type": "bool",
+        "hint": "开启后，插件会在设定时间自动检查并播报当日寿星名单。",
+        "default": true
+      },
+      "auto_broadcast_time": {
+        "description": "生日名单播报时间",
+        "type": "string",
+        "hint": "按 24 小时制填写，例如 08:00 或 20:30。",
+        "default": "08:00"
       }
     }
   },
@@ -467,6 +509,18 @@
         "type": "string",
         "hint": "按 24 小时制填写，例如 03:00 或 23:30。",
         "default": "03:00"
+      }
+    }
+  },
+  "negative_settings": {
+    "description": "负分提示设置",
+    "type": "object",
+    "items": {
+      "debt_message": {
+        "description": "负分状态提示文案",
+        "type": "string",
+        "hint": "用户在负分状态下尝试抽奖时显示的提示文案。",
+        "default": "你已背负债务，请穿上女仆装打工。"
       }
     }
   },

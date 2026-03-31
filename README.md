@@ -3,9 +3,9 @@
 ## 插件简介
 `astrbot_plugin_point_system` 是一个面向 AstrBot 群聊场景的积分互动插件，围绕“签到、活跃、抽奖、兑换、管理”这几类高频玩法设计。它支持按群维护成员信息、自动保存数据、定时备份、日期口令奖励，以及负分限制和群头衔联动，适合做群活跃体系或轻量积分经济。
 
-**版本：1.8.0**  
+**版本：1.8.5**  
 **展示名称：** `群积分助手`  
-**GitHub 仓库：** [https://github.com/astrbot/astrbot_plugin_point_system](https://github.com/astrbot/astrbot_plugin_point_system)
+**GitHub 仓库：** [https://github.com/menglimi/astrbot_plugin_point_system](https://github.com/menglimi/astrbot_plugin_point_system)
 
 ---
 
@@ -19,6 +19,7 @@
 2. 重启 AstrBot 或在插件管理中重新加载插件
 3. 在 AstrBot 管理面板中根据 `_conf_schema.json` 调整配置
 4. 首次运行后会自动在插件数据目录下生成积分数据文件
+5. 插件目录附带了最小 [requirements.txt](C:/Users/99505/.astrbot/data/plugins/astrbot_plugin_point_system/requirements.txt) 说明文件；插件本身没有额外第三方 pip 依赖，运行依赖 AstrBot 主程序环境
 
 ---
 
@@ -32,7 +33,7 @@
 - 兑换玩法：支持积分兑换群头衔、设精消息和禁言
 - 管理指令：支持独立管理员名单，允许通过 `@用户` 或直接输入 QQ 号增减积分
 - 日期口令奖励：支持按日期、关键词、范围、概率发放奖励
-- 生日系统：支持记录生日、生日签到奖励，以及每天 08:00 自动播报当日寿星名单
+- 生日系统：支持记录生日、生日签到奖励，以及按配置时间自动播报当日寿星名单
 - 自动备份：支持多备份目标和每日定时备份
 - 负分联动：负分用户仅可签到恢复积分，不能抽奖，并自动同步 `群女仆X号` 头衔
 
@@ -48,7 +49,7 @@
 - 群聊活跃奖励
 - 日期口令奖励
 - 生日签到奖励
-- 每天 08:00 生日名单播报
+- 定时生日名单播报
 - 抽奖中奖返利
 
 ### 消耗积分
@@ -95,16 +96,16 @@
 | `/兑换禁言` | 兑换自禁言 | `/兑换禁言` |
 | `/兑换禁言 @某用户` | 兑换禁言他人 | `需先开启 allow_mute_others` |
 | `/记录生日 10/24` | 记录自己的生日 | `/记录生日 10/24` |
-| `/生日签到` | 领取年度生日祝福与 50 积分；未记录时自动记录为今天 | `/生日签到` |
+| `/生日签到` | 领取年度生日祝福与生日奖励；未记录时可按配置自动记录为今天 | `/生日签到` |
 
 ### 无前缀口令
-默认关键词为 `星缘`，可以在配置中单独修改。
+签到和抽奖关键词都可在配置中单独修改。
 
 | 口令 | 说明 |
 | :--- | :--- |
-| `星缘签到` / `签到星缘` | 无前缀签到 |
-| `星缘抽奖` / `抽奖星缘` | 无前缀抽奖，直接走当前默认抽奖模式 |
-| `生日签到` | 无前缀生日签到，效果同 `/生日签到` |
+| `<签到关键词>签到` / `签到<签到关键词>` | 无前缀签到 |
+| `<抽奖关键词>抽奖` / `抽奖<抽奖关键词>` | 无前缀抽奖，直接走当前默认抽奖模式 |
+| `<生日签到触发词>` | 无前缀生日签到，效果同 `/生日签到` |
 
 ### 管理员指令
 | 指令 | 说明 | 示例 |
@@ -113,6 +114,7 @@
 | `/给积分 123456789 100` | 通过 QQ 号为目标用户增加积分 | `/给积分 123456789 100` |
 | `/扣积分 @用户 50` | 扣除目标用户积分 | `/扣积分 @某用户 50` |
 | `/扣积分 123456789 50` | 通过 QQ 号扣除目标用户积分 | `/扣积分 123456789 50` |
+| `/清空所有数据 确认` | 清空全部积分、抽奖、生日与群记录 | `/清空所有数据 确认` |
 
 管理员权限由 `admin_settings.points_admin_ids` 控制，只有配置过的 QQ 号可以增减积分。
 
@@ -148,6 +150,14 @@
 - `sign_in_trigger`：旧版兼容用的完整签到口令
 - `sign_in_trigger_keyword`：签到口令关键词，支持“关键词+签到”和“签到+关键词”
 - `lottery_trigger_keyword`：抽奖口令关键词，支持“关键词+抽奖”和“抽奖+关键词”
+
+### 生日配置
+- `birthday_settings.enabled`：是否开启生日功能
+- `birthday_settings.sign_in_trigger`：生日签到触发词
+- `birthday_settings.reward_points`：生日签到奖励积分
+- `birthday_settings.auto_record_when_unset`：未记录生日时是否自动记为当天
+- `birthday_settings.auto_broadcast_enabled`：是否开启寿星名单定时播报
+- `birthday_settings.auto_broadcast_time`：寿星名单播报时间，格式为 `HH:MM`
 
 ### 活跃奖励配置
 - `activity_settings.enabled`：是否开启活跃奖励
@@ -190,10 +200,13 @@
 - `backup_settings.backup_paths`：备份目标列表，支持目录和文件路径
 - `backup_settings.auto_backup_time`：自动备份时间，格式为 `HH:MM`
 
+### 负分提示配置
+- `negative_settings.debt_message`：负分状态下尝试抽奖时显示的提示文案
+
 ---
 
 ## 数据文件
-- 主数据文件：`C:\Users\99505\.astrbot\data\plugin_data\astrbot_plugin_point_system\points_data.json`
+- 主数据文件：`<AstrBot数据目录>\plugin_data\astrbot_plugin_point_system\points_data.json`
 - 备份文件：按配置写入 `backup_settings.backup_paths`
 - 数据写入方式：锁保护 + 原子替换，减少异常退出时的损坏风险
 
@@ -213,7 +226,7 @@
 ## 运行与验证
 当前目录不是 Git 仓库，且本地 Python 环境未安装 `astrbot` 模块，因此无法在当前终端完成完整运行态联调。当前已完成的本地验证如下：
 
-- `python -m py_compile main.py`
+- `python -m py_compile main.py birthday_feature.py lottery_feature.py`
 - `_conf_schema.json` UTF-8 JSON 解析检查
 
 ---
@@ -226,14 +239,38 @@
 - 无前缀关键词改为可配置
 
 ### 1.7.2
-- 新增 `生日签到`，每位用户每年可领取一次生日祝福与 50 积分
+- 新增 `生日签到`，每位用户每年可领取一次生日祝福与生日奖励
 - 负分状态下的抽奖拦截提示调整为债务 / 女仆装风格文案
 
 ### 1.8.0
 - 新增 `/记录生日 mm/dd`，可手动记录生日
 - 生日当天使用普通签到也会自动触发生日签到奖励
 - 未记录生日时使用 `/生日签到` 或 `生日签到` 会自动将今天记为生日
-- 每天 08:00 自动检查群内寿星并发送名单，没有寿星则不播报
+- 每天按配置时间自动检查群内寿星并发送名单，没有寿星则不播报
+
+### 1.8.1
+- 去除生日功能和负分提示中的硬编码文案，改为配置驱动
+- 文档中的无前缀触发词、生日奖励和播报时间改为通用占位说明
+- 移除写死的 `星缘积分规则` 别名，避免品牌绑定
+
+### 1.8.2
+- 简化签到成功、重复签到和积分查询等高频提示
+- 统一所有普通返回消息为单句输出，避免分段刷屏
+
+### 1.8.3
+- 修复非酋事件扣分仍被限制为最低 0 的问题，现在可以正确进入负分
+- 将生日相关逻辑拆分到 `birthday_feature.py`
+- 将抽奖相关逻辑拆分到 `lottery_feature.py`
+- 同步修正作者与仓库地址信息
+
+### 1.8.4
+- 新增积分管理员指令 `/清空所有数据 确认`
+- 清空时会重置全部积分、抽奖、生日和群记录
+- 在 QQ / AIOCQHTTP 环境下会尽量先移除已同步的负分头衔
+
+### 1.8.5
+- 新增最小 `requirements.txt`
+- 明确插件本身无额外第三方 pip 依赖，运行依赖 AstrBot 主程序环境
 
 ### 1.7.0
 - 支持负分
@@ -259,9 +296,9 @@
 ---
 
 ## 开发信息
-1. 开发者：`AstrBot`
+1. 开发者：`menglimi`
 2. 插件标识：`astrbot_plugin_point_system`
 3. 展示名称：`群积分助手`
-4. 仓库地址：[https://github.com/astrbot/astrbot_plugin_point_system](https://github.com/astrbot/astrbot_plugin_point_system)
-5. 数据目录：`C:\Users\99505\.astrbot\data\plugin_data\astrbot_plugin_point_system`
+4. 仓库地址：[https://github.com/menglimi/astrbot_plugin_point_system](https://github.com/menglimi/astrbot_plugin_point_system)
+5. 数据目录：`<AstrBot数据目录>\plugin_data\astrbot_plugin_point_system`
 6. 当前终端环境：可完成语法与配置校验，暂不支持完整 AstrBot 运行态联调

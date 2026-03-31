@@ -8,19 +8,25 @@ import shutil
 from typing import Any, Dict
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, Plain, Reply
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import At, Reply
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
 
+try:
+    from .birthday_feature import BirthdayFeatureMixin
+    from .lottery_feature import LotteryFeatureMixin
+except ImportError:
+    from birthday_feature import BirthdayFeatureMixin
+    from lottery_feature import LotteryFeatureMixin
+
 PLUGIN_NAME = "astrbot_plugin_point_system"
 DATA_VERSION = 7
 DEFAULT_POINTS_NAME = "积分"
 GLOBAL_SIGN_IN_SCOPE_ID = "__global_sign_in__"
-BIRTHDAY_SIGN_IN_TRIGGER = "生日签到"
-BIRTHDAY_SIGN_IN_REWARD = 50
+DEFAULT_NEGATIVE_DEBT_MESSAGE = "你已背负债务，请穿上女仆装打工。"
 INVALID_DISPLAY_NAMES = {
     "未绑定账号",
     "未知用户",
@@ -34,65 +40,23 @@ LEGACY_DEFAULT_TEMPLATES = {
     "query_points": "报告！您当前拥有 {total} {name}。",
 }
 DEFAULT_TEMPLATES = {
-    "sign_in_success": (
-        "{user}签到成功，获得 {points} {name}{bonus_detail}。"
-        "当前共有 {total} {name}，连续签到 {streak} 天，累计签到 {total_sign_in_days} 天。"
-    ),
-    "already_signed_in": (
-        "{user}今天已经签到过啦。"
-        "当前共有 {total} {name}，连续签到 {streak} 天，累计签到 {total_sign_in_days} 天。"
-    ),
-    "query_points": (
-        "{user}当前拥有 {total} {name}。"
-        "连续签到 {streak} 天，累计签到 {total_sign_in_days} 天，今日状态：{sign_in_status}。"
-    ),
+    "sign_in_success": "{user}签到成功，获得 {points} {name}，当前共有 {total} {name}，连续签到 {streak} 天，累计签到 {total_sign_in_days} 天。",
+    "already_signed_in": "{user}今天已经签到过啦，当前共有 {total} {name}，连续签到 {streak} 天，累计签到 {total_sign_in_days} 天。",
+    "query_points": "{user}当前拥有 {total} {name}，连续签到 {streak} 天，累计签到 {total_sign_in_days} 天，今日状态：{sign_in_status}。",
 }
-DEFAULT_PERSONAL_LOTTERY_PRIZES = {
-    "fifth": {
-        "label": "五等奖",
-        "min_points": 0,
-        "max_points": 5,
-        "weight": 40.0,
-    },
-    "fourth": {
-        "label": "四等奖",
-        "min_points": 6,
-        "max_points": 15,
-        "weight": 30.0,
-    },
-    "third": {
-        "label": "三等奖",
-        "min_points": 16,
-        "max_points": 25,
-        "weight": 20.0,
-    },
-    "second": {
-        "label": "二等奖",
-        "min_points": 26,
-        "max_points": 40,
-        "weight": 9.7,
-    },
-    "first": {
-        "label": "一等奖",
-        "min_points": 100,
-        "max_points": 100,
-        "weight": 0.3,
-    },
-}
-DEFAULT_GROUP_LOTTERY_RATIOS = [1.0, 9.0, 20.0, 25.0, 35.0]
 COMMAND_TEXT_PATTERN = re.compile(
-    r"^(?:签到|生日签到|记录生日|我的积分|积分榜|积分规则|抽奖|兑换头衔|兑换设精|兑换禁言|给积分|扣积分)(?:\s|$)"
+    r"^(?:签到|生日签到|记录生日|我的积分|积分榜|积分规则|抽奖|兑换头衔|兑换设精|兑换禁言|给积分|扣积分|清空所有数据)(?:\s|$)"
 )
 
 
 @register(
     PLUGIN_NAME,
-    "AstrBot",
+    "menglimi",
     "群积分助手。支持每日签到、活跃奖励、按群排行榜，以及个人抽奖、群体抽奖、日期口令奖励和头衔/设精/禁言等互动功能。",
-    "1.8.0",
-    "https://github.com/astrbot/astrbot_plugin_point_system",
+    "1.8.5",
+    "https://github.com/menglimi/astrbot_plugin_point_system",
 )
-class PointSystemPlugin(Star):
+class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
     def __init__(self, context: Context, config: Dict[str, Any]):
         super().__init__(context)
         self.config = config
@@ -155,7 +119,20 @@ class PointSystemPlugin(Star):
     def _single_line_message(self, text: Any) -> str:
         if text is None:
             return ""
-        return str(text).replace("\r", "").replace("\n", "").strip()
+        normalized = str(text).replace("\r", " ").replace("\n", " ").strip()
+        normalized = re.sub(r"\s+", " ", normalized)
+        normalized = normalized.replace("；", "，").replace(";", "，")
+        parts = [
+            part.strip(" ，。！？!?")
+            for part in re.split(r"[。！？!?]+", normalized)
+            if part.strip(" ，。！？!?")
+        ]
+        if not parts:
+            return ""
+        return "，".join(parts) + "。"
+
+    def _plain_result(self, event: AstrMessageEvent, text: Any):
+        return event.plain_result(self._single_line_message(text))
 
     def _normalize_backup_time(self, value: Any) -> str:
         text = self._normalize_text(value).strip()
@@ -793,150 +770,44 @@ class PointSystemPlugin(Star):
             ),
         }
 
-    def _normalize_personal_lottery_prizes(self, raw_prizes: Any) -> list[Dict[str, Any]]:
-        if not isinstance(raw_prizes, dict):
-            raw_prizes = {}
+    def _get_birthday_settings(self) -> Dict[str, Any]:
+        birthday_cfg = self.config.get("birthday_settings", {})
+        if not isinstance(birthday_cfg, dict):
+            birthday_cfg = {}
 
-        prizes: list[Dict[str, Any]] = []
-        total_weight = 0.0
-        for key, defaults in DEFAULT_PERSONAL_LOTTERY_PRIZES.items():
-            prize_cfg = raw_prizes.get(key, {})
-            if not isinstance(prize_cfg, dict):
-                prize_cfg = {}
-
-            label = prize_cfg.get("label", defaults["label"])
-            if not isinstance(label, str) or not label.strip():
-                label = defaults["label"]
-
-            min_points = self._normalize_int(
-                prize_cfg.get("min_points"), defaults["min_points"], minimum=0
-            )
-            max_points = self._normalize_int(
-                prize_cfg.get("max_points"), defaults["max_points"], minimum=0
-            )
-            if max_points < min_points:
-                min_points, max_points = max_points, min_points
-
-            weight = self._normalize_float(
-                prize_cfg.get("weight"), defaults["weight"], minimum=0.0
-            )
-            total_weight += weight
-            prizes.append(
-                {
-                    "key": key,
-                    "label": label.strip(),
-                    "min_points": min_points,
-                    "max_points": max_points,
-                    "weight": weight,
-                }
-            )
-
-        if total_weight <= 0:
-            return [
-                {
-                    "key": key,
-                    "label": defaults["label"],
-                    "min_points": defaults["min_points"],
-                    "max_points": defaults["max_points"],
-                    "weight": defaults["weight"],
-                }
-                for key, defaults in DEFAULT_PERSONAL_LOTTERY_PRIZES.items()
-            ]
-
-        return prizes
-
-    def _normalize_ratio_values(
-        self, raw_values: Any, default: list[float]
-    ) -> list[float]:
-        if isinstance(raw_values, str):
-            values = re.split(r"[,，\s]+", raw_values.strip())
-        elif isinstance(raw_values, list):
-            values = raw_values
-        else:
-            values = []
-
-        ratios = [
-            self._normalize_float(item, 0.0, minimum=0.0)
-            for item in values
-            if str(item).strip()
-        ]
-        ratios = [item for item in ratios if item > 0]
-        return ratios or default.copy()
-
-    def _get_lottery_settings(self) -> Dict[str, Any]:
-        lottery_cfg = self.config.get("lottery_settings", {})
-        if not isinstance(lottery_cfg, dict):
-            lottery_cfg = {}
-
-        raw_default_mode = str(
-            lottery_cfg.get("default_mode", lottery_cfg.get("mode", "personal"))
-        ).strip().lower()
-        mode_alias_map = {
-            "single": "personal",
-            "personal": "personal",
-            "个人": "personal",
-            "单人": "personal",
-            "shared": "group",
-            "group": "group",
-            "群体": "group",
-            "团体": "group",
-        }
-        default_mode = mode_alias_map.get(raw_default_mode, "personal")
-
-        personal_enabled = bool(lottery_cfg.get("personal_enabled", True))
-        group_enabled = bool(lottery_cfg.get("group_enabled", True))
-        enabled = bool(lottery_cfg.get("enabled", True)) and (
-            personal_enabled or group_enabled
+        trigger = self._normalize_trigger_token(
+            birthday_cfg.get("sign_in_trigger", "生日签到"),
+            "生日签到",
         )
-
-        if default_mode == "personal" and not personal_enabled and group_enabled:
-            default_mode = "group"
-        elif default_mode == "group" and not group_enabled and personal_enabled:
-            default_mode = "personal"
-
-        personal_prizes = self._normalize_personal_lottery_prizes(
-            lottery_cfg.get("personal_prizes", lottery_cfg.get("prizes", {}))
-        )
-        group_ratios = self._normalize_ratio_values(
-            lottery_cfg.get("group_distribution_ratios"),
-            DEFAULT_GROUP_LOTTERY_RATIOS,
-        )
-        group_required_participants = self._normalize_int(
-            lottery_cfg.get("group_required_participants"), 5, minimum=2
-        )
-        if len(group_ratios) < group_required_participants:
-            group_ratios.extend([1.0] * (group_required_participants - len(group_ratios)))
-        elif len(group_ratios) > group_required_participants:
-            group_ratios = group_ratios[:group_required_participants]
-
         return {
-            "enabled": enabled,
-            "default_mode": default_mode,
-            "personal_enabled": personal_enabled,
-            "group_enabled": group_enabled,
-            "personal_cost": self._normalize_int(
-                lottery_cfg.get("personal_cost", lottery_cfg.get("cost", 20)),
-                20,
+            "enabled": bool(birthday_cfg.get("enabled", True)),
+            "sign_in_trigger": trigger,
+            "reward_points": self._normalize_int(
+                birthday_cfg.get("reward_points"),
+                50,
                 minimum=0,
             ),
-            "personal_daily_limit": self._normalize_int(
-                lottery_cfg.get(
-                    "personal_daily_limit", lottery_cfg.get("single_daily_limit", 1)
-                ),
-                1,
-                minimum=1,
+            "auto_record_when_unset": bool(
+                birthday_cfg.get("auto_record_when_unset", True)
             ),
-            "personal_prizes": personal_prizes,
-            "group_cost": self._normalize_int(
-                lottery_cfg.get("group_cost", lottery_cfg.get("cost", 20)),
-                20,
-                minimum=0,
+            "auto_broadcast_enabled": bool(
+                birthday_cfg.get("auto_broadcast_enabled", True)
             ),
-            "group_daily_limit_per_user": self._normalize_int(
-                lottery_cfg.get("group_daily_limit_per_user"), 1, minimum=1
+            "auto_broadcast_time": self._normalize_backup_time(
+                birthday_cfg.get("auto_broadcast_time", "08:00")
             ),
-            "group_required_participants": group_required_participants,
-            "group_distribution_ratios": group_ratios,
+        }
+
+    def _get_negative_settings(self) -> Dict[str, Any]:
+        negative_cfg = self.config.get("negative_settings", {})
+        if not isinstance(negative_cfg, dict):
+            negative_cfg = {}
+
+        debt_message = self._normalize_text(
+            negative_cfg.get("debt_message", DEFAULT_NEGATIVE_DEBT_MESSAGE)
+        ).strip()
+        return {
+            "debt_message": debt_message or DEFAULT_NEGATIVE_DEBT_MESSAGE,
         }
 
     def _get_special_date_reward_entries(self) -> list[Dict[str, Any]]:
@@ -1164,16 +1035,6 @@ class PointSystemPlugin(Star):
         except ValueError:
             return None
 
-    def _resolve_lottery_mode(
-        self, raw_args: str, lottery_cfg: Dict[str, Any]
-    ) -> str:
-        first_arg = raw_args.strip().split(maxsplit=1)[0].lower() if raw_args else ""
-        if first_arg in {"个人", "单人", "personal", "single"}:
-            return "personal"
-        if first_arg in {"群体", "团体", "group", "shared"}:
-            return "group"
-        return lottery_cfg["default_mode"]
-
     def _is_scope_matched(
         self, scope: list[str], event: AstrMessageEvent, user_id: str
     ) -> bool:
@@ -1279,7 +1140,7 @@ class PointSystemPlugin(Star):
         return ""
 
     def _get_negative_debt_message(self) -> str:
-        return "你已背负债务，请穿上女仆装打工。"
+        return self._get_negative_settings()["debt_message"]
 
     async def _generate_sign_in_fortune_text(
         self,
@@ -1326,195 +1187,6 @@ class PointSystemPlugin(Star):
             logger.warning(f"签到彩蛋 LLM 回复失败，已回退默认文案: {exc}")
 
         return self._single_line_message(fallback)
-
-    async def _generate_birthday_blessing_text(
-        self, event: AstrMessageEvent, reply_name: str, reward_points: int
-    ) -> str:
-        provider = None
-        try:
-            provider = self.context.get_using_provider(event.unified_msg_origin)
-        except Exception as exc:
-            logger.debug(f"获取生日签到 LLM provider 失败: {exc}")
-
-        fallback = (
-            f"{reply_name}生日快乐，愿你今天被温柔以待、好运常伴！"
-            f"已为你送上 {reward_points} {self._get_points_name()}。"
-        )
-        if not provider:
-            return self._single_line_message(fallback)
-
-        prompt = (
-            f"群成员 {reply_name} 发送了“{BIRTHDAY_SIGN_IN_TRIGGER}”，"
-            f"系统将发放 {reward_points} 点积分作为生日奖励。"
-            "请写一句温暖、自然、适合群聊发送的中文生日祝福。"
-            "不要使用 markdown，不要分段，不要超过 45 个字。"
-        )
-        try:
-            llm_resp = await provider.text_chat(
-                prompt=prompt,
-                session_id=event.unified_msg_origin,
-                persist=False,
-            )
-            content = self._extract_llm_response_text(llm_resp)
-            if content:
-                return self._single_line_message(content)
-        except Exception as exc:
-            logger.warning(f"生日签到 LLM 祝福生成失败，已回退默认文案: {exc}")
-
-        return self._single_line_message(fallback)
-
-    async def _try_birthday_sign_in(
-        self, event: AstrMessageEvent, message: str
-    ) -> str | None:
-        if self._normalize_trigger_token(message) != self._normalize_trigger_token(
-            BIRTHDAY_SIGN_IN_TRIGGER
-        ):
-            return None
-
-        user_id = str(event.get_sender_id())
-        reply_name = self._get_sender_reply_name(event)
-        now = datetime.datetime.now()
-        current_year = str(now.year)
-        today_md = self._get_today_birthday_md(now)
-
-        async with self._data_lock:
-            user_info = self._get_user_record(user_id)
-            group_member_changed = self._touch_group_member(
-                event, user_id, self._get_sender_display_name(event)
-            )
-            birthday_md = self._normalize_birthday_md(user_info.get("birthday_md"))
-            auto_recorded = False
-            if not birthday_md:
-                birthday_md = today_md
-                user_info["birthday_md"] = birthday_md
-                auto_recorded = True
-
-            if birthday_md != today_md:
-                if group_member_changed:
-                    await self._save_data_locked()
-                return (
-                    f"{reply_name}记录的生日是 {birthday_md}，今天还不是你的生日，"
-                    "先把祝福留到当天吧。"
-                )
-
-            if user_info.get("last_birthday_sign_in_year") == current_year:
-                if group_member_changed:
-                    await self._save_data_locked()
-                return f"{reply_name}今年的生日签到奖励已经领过啦，明年再来吧。"
-
-            user_info["points"] += BIRTHDAY_SIGN_IN_REWARD
-            user_info["last_birthday_sign_in_year"] = current_year
-            total_points = user_info["points"]
-            await self._save_data_locked()
-
-        await self._refresh_negative_titles_for_user(event, user_id)
-
-        blessing_text = await self._generate_birthday_blessing_text(
-            event, reply_name, BIRTHDAY_SIGN_IN_REWARD
-        )
-        record_text = (
-            f"已自动为你记录生日 {today_md}，" if auto_recorded else ""
-        )
-        return self._single_line_message(
-            f"{record_text}{blessing_text}获得 {BIRTHDAY_SIGN_IN_REWARD} {self._get_points_name()}，"
-            f"当前共有 {total_points} {self._get_points_name()}。"
-        )
-
-    def _apply_birthday_reward_locked(
-        self, user_info: Dict[str, Any], now: datetime.datetime | None = None
-    ) -> bool:
-        if now is None:
-            now = datetime.datetime.now()
-        birthday_md = self._normalize_birthday_md(user_info.get("birthday_md"))
-        if not birthday_md or birthday_md != self._get_today_birthday_md(now):
-            return False
-        current_year = str(now.year)
-        if self._normalize_text(user_info.get("last_birthday_sign_in_year")) == current_year:
-            return False
-        user_info["points"] += BIRTHDAY_SIGN_IN_REWARD
-        user_info["last_birthday_sign_in_year"] = current_year
-        return True
-
-    async def _birthday_broadcast_loop(self) -> None:
-        while not self._birthday_broadcast_stop_event.is_set():
-            now = datetime.datetime.now()
-            if now.hour >= 8:
-                await self._run_birthday_broadcast()
-                now = datetime.datetime.now()
-            next_run = now.replace(hour=8, minute=0, second=0, microsecond=0)
-            if next_run <= now:
-                next_run += datetime.timedelta(days=1)
-
-            wait_seconds = max((next_run - now).total_seconds(), 1)
-            try:
-                await asyncio.wait_for(
-                    self._birthday_broadcast_stop_event.wait(), timeout=wait_seconds
-                )
-                break
-            except asyncio.TimeoutError:
-                await self._run_birthday_broadcast()
-
-    async def _run_birthday_broadcast(self) -> None:
-        today = datetime.date.today()
-        today_iso = today.isoformat()
-        today_md = self._get_today_birthday_md(
-            datetime.datetime.combine(today, datetime.time.min)
-        )
-
-        pending_messages: list[tuple[str, str, str]] = []
-        async with self._data_lock:
-            users = self.data.setdefault("users", {})
-            groups = self.data.setdefault("groups", {})
-            for group_id, group_info in groups.items():
-                if not isinstance(group_info, dict):
-                    continue
-                if self._normalize_text(group_info.get("last_birthday_broadcast_date")) == today_iso:
-                    continue
-
-                target = self._normalize_text(group_info.get("message_target"))
-                if not target:
-                    continue
-
-                members = group_info.get("members", {})
-                if not isinstance(members, dict):
-                    continue
-
-                birthday_names: list[str] = []
-                for user_id, member_info in members.items():
-                    user_info = users.get(user_id)
-                    if not isinstance(user_info, dict):
-                        continue
-                    if self._normalize_birthday_md(user_info.get("birthday_md")) != today_md:
-                        continue
-                    display_name = self._safe_display_name(
-                        member_info.get("display_name") if isinstance(member_info, dict) else None,
-                        str(user_id),
-                    )
-                    birthday_names.append(display_name)
-
-                if birthday_names:
-                    names_text = "、".join(birthday_names)
-                    text = f"今日寿星名单：{names_text}，祝大家生日快乐！"
-                    pending_messages.append((str(group_id), target, text))
-
-        sent_group_ids: list[str] = []
-        for group_id, target, text in pending_messages:
-            try:
-                await self.context.send_message(target, MessageChain([Plain(text)]))
-                sent_group_ids.append(group_id)
-            except Exception as exc:
-                logger.warning(f"发送生日播报失败: group={group_id}, error={exc}")
-
-        if not sent_group_ids:
-            return
-
-        async with self._data_lock:
-            groups = self.data.setdefault("groups", {})
-            for group_id in sent_group_ids:
-                group_info = groups.get(group_id)
-                if isinstance(group_info, dict):
-                    group_info["last_birthday_broadcast_date"] = today_iso
-            await self._save_data_locked()
 
     def _resolve_fortune_event_type(
         self, user_info: Dict[str, Any], sign_cfg: Dict[str, Any]
@@ -1652,80 +1324,51 @@ class PointSystemPlugin(Star):
                     member_info["negative_title"] = desired_title
             await self._save_data_locked()
 
-    def _roll_lottery_prize(self, prizes: list[Dict[str, Any]]) -> tuple[Dict[str, Any], int]:
-        total_weight = sum(max(float(item.get("weight", 0.0)), 0.0) for item in prizes)
-        if total_weight <= 0:
-            fallback = prizes[0]
-            return fallback, fallback["min_points"]
+    async def _clear_negative_titles_before_reset(self, event: AstrMessageEvent) -> int:
+        if not isinstance(event, AiocqhttpMessageEvent):
+            return 0
+        if not getattr(event, "bot", None):
+            return 0
 
-        threshold = random.uniform(0, total_weight)
-        current = 0.0
-        selected = prizes[-1]
-        for prize in prizes:
-            current += max(float(prize.get("weight", 0.0)), 0.0)
-            if threshold <= current:
-                selected = prize
-                break
+        async with self._data_lock:
+            users = self.data.get("users", {})
+            groups = self.data.get("groups", {})
+            planned_updates: list[tuple[str, str]] = []
 
-        reward_points = random.randint(
-            int(selected["min_points"]), int(selected["max_points"])
-        )
-        return selected, reward_points
+            for group_id, group_info in groups.items():
+                if not isinstance(group_info, dict):
+                    continue
+                members = group_info.get("members", {})
+                if not isinstance(members, dict):
+                    continue
 
-    def _calculate_group_lottery_rewards(
-        self, total_points: int, ratios: list[float]
-    ) -> list[int]:
-        total_ratio = sum(ratios)
-        if total_points <= 0 or total_ratio <= 0:
-            return [0 for _ in ratios]
+                for member_user_id, member_info in members.items():
+                    if not isinstance(member_info, dict):
+                        continue
+                    current_title = self._normalize_text(member_info.get("negative_title"))
+                    is_negative_user = users.get(member_user_id, {}).get("points", 0) < 0
+                    if current_title or is_negative_user:
+                        planned_updates.append((str(group_id), str(member_user_id)))
 
-        raw_rewards = [(total_points * ratio) / total_ratio for ratio in ratios]
-        rewards = [int(item) for item in raw_rewards]
-        remainder = total_points - sum(rewards)
-        order = sorted(
-            range(len(raw_rewards)),
-            key=lambda index: (raw_rewards[index] - rewards[index], ratios[index]),
-            reverse=True,
-        )
-        for index in order[:remainder]:
-            rewards[index] += 1
-        return rewards
+        if not planned_updates:
+            return 0
 
-    def _refund_expired_group_lottery_locked(
-        self, group_info: Dict[str, Any], today: str
-    ) -> str:
-        pool = group_info.setdefault(
-            "group_lottery_pool", {"date": "", "participants": []}
-        )
-        pool_date = self._normalize_text(pool.get("date"))
-        participants = pool.get("participants", [])
-        if not pool_date or pool_date == today or not isinstance(participants, list):
-            return ""
-        if not participants:
-            pool["date"] = ""
-            return ""
+        cleared_count = 0
+        for group_id, member_user_id in planned_updates:
+            try:
+                await event.bot.set_group_special_title(
+                    group_id=int(group_id),
+                    user_id=int(member_user_id),
+                    special_title="",
+                    duration=-1,
+                )
+                cleared_count += 1
+            except Exception as exc:
+                logger.warning(
+                    f"清空数据前移除负分头衔失败: group={group_id}, user={member_user_id}, error={exc}"
+                )
 
-        refunded_count = 0
-        for participant in participants:
-            if not isinstance(participant, dict):
-                continue
-            user_id = str(participant.get("user_id", "")).strip()
-            if not user_id:
-                continue
-            paid_points = self._normalize_int(participant.get("paid_points"), 0, 0)
-            if paid_points <= 0:
-                continue
-            user_info = self._get_user_record(user_id)
-            user_info["points"] += paid_points
-            refunded_count += 1
-
-        pool["date"] = ""
-        pool["participants"] = []
-        if refunded_count <= 0:
-            return ""
-        return (
-            f"上一轮群体抽奖因跨日仍未满员，已自动退还 {refunded_count} 名参与者的报名积分。"
-        )
+        return cleared_count
 
     async def _try_special_date_reward(
         self, event: AstrMessageEvent, message: str
@@ -1921,7 +1564,7 @@ class PointSystemPlugin(Star):
                 if group_member_changed:
                     await self._save_data_locked()
 
-                yield event.plain_result(
+                yield self._plain_result(event, 
                     self._format_msg(
                         "already_signed_in",
                         user=reply_name,
@@ -1984,11 +1627,8 @@ class PointSystemPlugin(Star):
                     user_info["points"] += sign_cfg["fortune_event_points"]
                     fortune_points_delta = sign_cfg["fortune_event_points"]
                 else:
-                    before_deduction = user_info["points"]
-                    user_info["points"] = max(
-                        0, user_info["points"] - sign_cfg["fortune_event_points"]
-                    )
-                    fortune_points_delta = before_deduction - user_info["points"]
+                    user_info["points"] -= sign_cfg["fortune_event_points"]
+                    fortune_points_delta = sign_cfg["fortune_event_points"]
 
             self._apply_fortune_pity_progress(user_info, fortune_event_type)
             birthday_reward_triggered = self._apply_birthday_reward_locked(user_info, now)
@@ -2015,17 +1655,18 @@ class PointSystemPlugin(Star):
             )
         birthday_text = ""
         if birthday_reward_triggered:
+            birthday_cfg = self._get_birthday_settings()
             blessing_text = await self._generate_birthday_blessing_text(
-                event, reply_name, BIRTHDAY_SIGN_IN_REWARD
+                event, reply_name, birthday_cfg["reward_points"]
             )
             birthday_text = (
-                f"{blessing_text}获得 {BIRTHDAY_SIGN_IN_REWARD} {self._get_points_name()}，"
+                f"{blessing_text}获得 {birthday_cfg['reward_points']} {self._get_points_name()}，"
                 f"当前共有 {total_points} {self._get_points_name()}。"
             )
 
         await self._refresh_negative_titles_for_user(event, user_id)
 
-        yield event.plain_result(
+        yield self._plain_result(event, 
             self._single_line_message(
                 self._format_msg(
                 "sign_in_success",
@@ -2058,34 +1699,6 @@ class PointSystemPlugin(Star):
         async for result in self._handle_sign_in(event):
             yield result
 
-    @filter.command("生日签到")
-    async def birthday_sign_in(self, event: AstrMessageEvent):
-        """领取生日签到奖励；未记录生日时会自动记录为今天。"""
-        message = self._normalize_text(event.message_str or BIRTHDAY_SIGN_IN_TRIGGER)
-        birthday_message = await self._try_birthday_sign_in(event, message)
-        if birthday_message is None:
-            birthday_message = f"请发送 {BIRTHDAY_SIGN_IN_TRIGGER} 来领取生日签到奖励。"
-        yield event.plain_result(birthday_message)
-
-    @filter.command("记录生日")
-    async def record_birthday(self, event: AstrMessageEvent):
-        """记录生日，格式：/记录生日 10/24"""
-        raw_value = self._get_command_args(event)
-        birthday_md = self._normalize_birthday_md(raw_value)
-        if not birthday_md:
-            yield event.plain_result("用法：/记录生日 10/24")
-            return
-
-        user_id = str(event.get_sender_id())
-        reply_name = self._get_sender_reply_name(event)
-        async with self._data_lock:
-            user_info = self._get_user_record(user_id)
-            self._touch_group_member(event, user_id, self._get_sender_display_name(event))
-            user_info["birthday_md"] = birthday_md
-            await self._save_data_locked()
-
-        yield event.plain_result(f"{reply_name}的生日已记录为 {birthday_md}。")
-
     @filter.command("我的积分")
     async def query_points(self, event: AstrMessageEvent):
         """查询自己当前拥有的积分总额。"""
@@ -2107,7 +1720,7 @@ class PointSystemPlugin(Star):
             if group_member_changed:
                 await self._save_data_locked()
 
-        yield event.plain_result(
+        yield self._plain_result(event, 
             self._format_msg(
                 "query_points",
                 user=reply_name,
@@ -2118,11 +1731,12 @@ class PointSystemPlugin(Star):
             )
         )
 
-    @filter.command("积分规则", alias={"星缘积分规则"})
+    @filter.command("积分规则")
     async def points_rules(self, event: AstrMessageEvent):
         """查看当前积分获取规则。"""
         points_name = self._get_points_name()
         sign_cfg = self._get_sign_in_settings()
+        birthday_cfg = self._get_birthday_settings()
         activity_cfg = self._get_activity_settings()
         lottery_cfg = self._get_lottery_settings()
         special_reward_entries = self._get_special_date_reward_entries()
@@ -2184,9 +1798,14 @@ class PointSystemPlugin(Star):
             lines.append("8. 群聊活跃奖励：当前未开启")
 
         lines.append(f"9. 无前缀签到：发送 {sign_in_examples} 也可以直接签到")
-        lines.append(
-            f"10. 生日签到：发送“{BIRTHDAY_SIGN_IN_TRIGGER}”可获得 {BIRTHDAY_SIGN_IN_REWARD} {points_name}，每人每年一次"
-        )
+        if birthday_cfg["enabled"] and birthday_cfg["reward_points"] > 0:
+            lines.append(
+                f"10. 生日签到：发送“{birthday_cfg['sign_in_trigger']}”可获得 {birthday_cfg['reward_points']} {points_name}，每人每年一次"
+            )
+            if birthday_cfg["auto_broadcast_enabled"]:
+                lines.append(
+                    f"11. 生日播报：每天 {birthday_cfg['auto_broadcast_time']} 自动检查并播报当日寿星名单"
+                )
 
         if lottery_cfg["enabled"]:
             mode_lines: list[str] = []
@@ -2202,242 +1821,21 @@ class PointSystemPlugin(Star):
                     f"满 {lottery_cfg['group_required_participants']} 人开奖"
                 )
             lines.append(
-                "11. 积分抽奖："
+                "12. 积分抽奖："
                 + "；".join(mode_lines)
                 + f"；默认模式：{'个人抽奖' if lottery_cfg['default_mode'] == 'personal' else '群体抽奖'}"
             )
-            lines.append(f"12. 无前缀抽奖：发送 {lottery_examples} 也可直接参与默认模式抽奖")
+            lines.append(f"13. 无前缀抽奖：发送 {lottery_examples} 也可直接参与默认模式抽奖")
         if special_reward_entries:
             enabled_entry_count = len(
                 [entry for entry in special_reward_entries if entry["enabled"]]
             )
-            lines.append(f"13. 日期口令奖励：当前启用 {enabled_entry_count} 条词条")
+            lines.append(f"14. 日期口令奖励：当前启用 {enabled_entry_count} 条词条")
         lines.append(
-            "14. 负分规则：负分用户只能通过每日签到恢复积分，无法参与抽奖；"
+            "15. 负分规则：负分用户只能通过每日签到恢复积分，无法参与抽奖；"
             "在已记录群聊中会自动佩戴“群女仆X号”头衔，转正后自动移除。"
         )
-        yield event.plain_result("；".join(lines))
-
-    @filter.command("抽奖")
-    async def lottery(self, event: AstrMessageEvent):
-        """消耗积分进行一次抽奖。"""
-        lottery_cfg = self._get_lottery_settings()
-        points_name = self._get_points_name()
-
-        if not lottery_cfg["enabled"]:
-            yield event.plain_result("当前未开启积分抽奖功能。")
-            return
-
-        mode = self._resolve_lottery_mode(self._get_command_args(event), lottery_cfg)
-        if mode == "personal" and not lottery_cfg["personal_enabled"]:
-            yield event.plain_result("当前未开启个人抽奖，请使用 /抽奖 群体 或在配置中打开个人抽奖开关。")
-            return
-        if mode == "group" and not lottery_cfg["group_enabled"]:
-            yield event.plain_result("当前未开启群体抽奖，请使用 /抽奖 个人 或在配置中打开群体抽奖开关。")
-            return
-
-        group_id = self._get_group_id(event)
-        if mode == "group" and not group_id:
-            yield event.plain_result("群体抽奖仅支持群聊中使用。")
-            return
-
-        user_id = str(event.get_sender_id())
-        today = datetime.date.today().isoformat()
-        reply_name = self._get_sender_reply_name(event)
-        message = ""
-
-        async with self._data_lock:
-            user_info = self._get_user_record(user_id)
-            group_member_changed = self._touch_group_member(
-                event, user_id, self._get_sender_display_name(event)
-            )
-            if group_member_changed:
-                await self._save_data_locked()
-            current_points = user_info["points"]
-
-        if current_points < 0:
-            yield event.plain_result(
-                f"{reply_name}{self._get_negative_debt_message()}当前只能通过每日签到恢复积分，暂时无法参与抽奖。"
-            )
-            return
-
-        async with self._data_lock:
-            user_info = self._get_user_record(user_id)
-
-            if mode == "personal":
-                user_draw_times = (
-                    user_info["daily_personal_lottery_times"]
-                    if user_info["last_personal_lottery_date"] == today
-                    else 0
-                )
-
-                if user_draw_times >= lottery_cfg["personal_daily_limit"]:
-                    if group_member_changed:
-                        await self._save_data_locked()
-                    message = (
-                        f"{reply_name}今天已经抽过个人奖啦，"
-                        f"个人抽奖每天最多 {lottery_cfg['personal_daily_limit']} 次。"
-                    )
-                elif user_info["points"] < lottery_cfg["personal_cost"]:
-                    if group_member_changed:
-                        await self._save_data_locked()
-                    message = (
-                        f"{reply_name}的{points_name}不足，个人抽奖需要 "
-                        f"{lottery_cfg['personal_cost']} {points_name}，"
-                        f"当前仅有 {user_info['points']} {points_name}。"
-                    )
-                else:
-                    prize, reward_points = self._roll_lottery_prize(
-                        lottery_cfg["personal_prizes"]
-                    )
-                    user_info["points"] = (
-                        user_info["points"] - lottery_cfg["personal_cost"] + reward_points
-                    )
-                    user_info["last_personal_lottery_date"] = today
-                    user_info["daily_personal_lottery_times"] = user_draw_times + 1
-                    user_info["lottery_draw_count"] += 1
-                    user_info["lottery_points_spent"] += lottery_cfg["personal_cost"]
-                    user_info["lottery_points_won"] += reward_points
-                    await self._save_data_locked()
-
-                    net_change = reward_points - lottery_cfg["personal_cost"]
-                    net_text = (
-                        f"净赚 {net_change}"
-                        if net_change >= 0
-                        else f"净变化 {net_change}"
-                    )
-                    message = (
-                        f"{reply_name}在个人抽奖中抽中了{prize['label']}，获得 {reward_points} {points_name}。"
-                        f"本次消耗 {lottery_cfg['personal_cost']} {points_name}，"
-                        f"{net_text} {points_name}，"
-                        f"当前余额 {user_info['points']} {points_name}。"
-                    )
-            else:
-                groups = self.data.setdefault("groups", {})
-                group_info = groups.setdefault(
-                    group_id,
-                    {"members": {}, "group_lottery_pool": {"date": "", "participants": []}},
-                )
-                refund_notice = self._refund_expired_group_lottery_locked(
-                    group_info, today
-                )
-                pool = group_info.setdefault(
-                    "group_lottery_pool", {"date": "", "participants": []}
-                )
-                if pool.get("date") != today:
-                    pool["date"] = today
-                    pool["participants"] = []
-
-                group_join_times = (
-                    user_info["daily_group_lottery_join_times"]
-                    if user_info["last_group_lottery_join_date"] == today
-                    else 0
-                )
-                participants = pool.setdefault("participants", [])
-                already_joined = any(
-                    isinstance(item, dict)
-                    and str(item.get("user_id", "")).strip() == user_id
-                    for item in participants
-                )
-
-                if already_joined or (
-                    group_join_times >= lottery_cfg["group_daily_limit_per_user"]
-                ):
-                    if group_member_changed or refund_notice:
-                        await self._save_data_locked()
-                    message = (
-                        f"{reply_name}今天已经参与过群体抽奖啦，"
-                        f"每人每天最多参与 {lottery_cfg['group_daily_limit_per_user']} 次。"
-                    )
-                elif user_info["points"] < lottery_cfg["group_cost"]:
-                    if group_member_changed or refund_notice:
-                        await self._save_data_locked()
-                    message = (
-                        f"{reply_name}的{points_name}不足，群体抽奖需要 "
-                        f"{lottery_cfg['group_cost']} {points_name}，"
-                        f"当前仅有 {user_info['points']} {points_name}。"
-                    )
-                else:
-                    user_info["points"] -= lottery_cfg["group_cost"]
-                    user_info["last_group_lottery_join_date"] = today
-                    user_info["daily_group_lottery_join_times"] = group_join_times + 1
-                    participants.append(
-                        {
-                            "user_id": user_id,
-                            "display_name": self._get_sender_display_name(event),
-                            "paid_points": lottery_cfg["group_cost"],
-                            "joined_at": datetime.datetime.now().isoformat(
-                                timespec="seconds"
-                            ),
-                        }
-                    )
-
-                    participant_count = len(participants)
-                    required_count = lottery_cfg["group_required_participants"]
-                    if participant_count < required_count:
-                        await self._save_data_locked()
-                        prefix = f"{refund_notice}；" if refund_notice else ""
-                        message = (
-                            f"{prefix}{reply_name}已加入群体抽奖池，扣除 "
-                            f"{lottery_cfg['group_cost']} {points_name}。"
-                            f"当前人数 {participant_count}/{required_count}，"
-                            "凑齐后将按配置比例分配奖池。"
-                        )
-                    else:
-                        shuffled_participants = list(participants)
-                        random.shuffle(shuffled_participants)
-                        total_pool_points = sum(
-                            self._normalize_int(item.get("paid_points"), 0, 0)
-                            for item in shuffled_participants
-                        )
-                        rewards = self._calculate_group_lottery_rewards(
-                            total_pool_points,
-                            lottery_cfg["group_distribution_ratios"],
-                        )
-
-                        results: list[tuple[str, int]] = []
-                        for participant, reward_points in zip(
-                            shuffled_participants, rewards
-                        ):
-                            target_user_id = str(participant["user_id"])
-                            target_user = self._get_user_record(target_user_id)
-                            paid_points = self._normalize_int(
-                                participant.get("paid_points"),
-                                lottery_cfg["group_cost"],
-                                0,
-                            )
-                            target_user["points"] += reward_points
-                            target_user["lottery_draw_count"] += 1
-                            target_user["lottery_points_spent"] += paid_points
-                            target_user["lottery_points_won"] += reward_points
-                            results.append(
-                                (
-                                    self._safe_display_name(
-                                        participant.get("display_name"), target_user_id
-                                    ),
-                                    reward_points,
-                                )
-                            )
-
-                        pool["participants"] = []
-                        await self._save_data_locked()
-
-                        results.sort(key=lambda item: item[1], reverse=True)
-                        lines = []
-                        if refund_notice:
-                            lines.append(refund_notice)
-                        lines.append(
-                            f"群体抽奖已满 {required_count} 人并开奖，总奖池 {total_pool_points} {points_name}。"
-                        )
-                        for index, (display_name, reward_points) in enumerate(
-                            results, start=1
-                        ):
-                            lines.append(
-                                f"第{index}位：{display_name}，获得 {reward_points} {points_name}"
-                            )
-                        message = "；".join(lines)
-
-        yield event.plain_result(self._single_line_message(message))
+        yield self._plain_result(event, "；".join(lines))
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message_gain_points(self, event: AstrMessageEvent):
@@ -2468,7 +1866,7 @@ class PointSystemPlugin(Star):
         birthday_sign_in_message = await self._try_birthday_sign_in(event, message)
         if birthday_sign_in_message is not None:
             event.stop_event()
-            yield event.plain_result(birthday_sign_in_message).stop_event()
+            yield self._plain_result(event, birthday_sign_in_message).stop_event()
             return
 
         if is_negative_user:
@@ -2478,7 +1876,7 @@ class PointSystemPlugin(Star):
             special_reward_message = await self._try_special_date_reward(event, message)
             if special_reward_message is not None:
                 if special_reward_message:
-                    yield event.plain_result(special_reward_message)
+                    yield self._plain_result(event, special_reward_message)
                 return
 
         activity_cfg = self._get_activity_settings()
@@ -2580,7 +1978,7 @@ class PointSystemPlugin(Star):
             else:
                 lines.append("您暂未上榜")
 
-        yield event.plain_result("；".join(lines))
+        yield self._plain_result(event, "；".join(lines))
 
     @filter.command("兑换头衔")
     async def exchange_title(self, event: AstrMessageEvent):
@@ -2589,21 +1987,21 @@ class PointSystemPlugin(Star):
         points_name = self._get_points_name()
 
         if not exchange_cfg["title_enabled"]:
-            yield event.plain_result("当前未开启积分兑换头衔功能。")
+            yield self._plain_result(event, "当前未开启积分兑换头衔功能。")
             return
 
         err = self._ensure_qq_group_exchange(event, "兑换头衔")
         if err:
-            yield event.plain_result(err)
+            yield self._plain_result(event, err)
             return
 
         raw_title = " ".join(self._get_command_args(event).split())
         if not raw_title:
-            yield event.plain_result("用法：/兑换头衔 头衔内容")
+            yield self._plain_result(event, "用法：/兑换头衔 头衔内容")
             return
 
         if len(raw_title) > exchange_cfg["title_max_length"]:
-            yield event.plain_result(
+            yield self._plain_result(event, 
                 f"头衔长度不能超过 {exchange_cfg['title_max_length']} 个字符。"
             )
             return
@@ -2612,7 +2010,7 @@ class PointSystemPlugin(Star):
             event, exchange_cfg["title_cost"]
         )
         if not success:
-            yield event.plain_result(
+            yield self._plain_result(event, 
                 f"积分不足，兑换头衔需要 {exchange_cfg['title_cost']} {points_name}，"
                 f"您当前仅有 {remaining_points} {points_name}。"
             )
@@ -2630,13 +2028,13 @@ class PointSystemPlugin(Star):
                 event, exchange_cfg["title_cost"]
             )
             logger.warning(f"积分兑换头衔失败，已自动退款: {exc}")
-            yield event.plain_result(
+            yield self._plain_result(event, 
                 f"兑换头衔失败，已退还 {exchange_cfg['title_cost']} {points_name}。"
                 f"当前余额：{refunded_points} {points_name}。"
             )
             return
 
-        yield event.plain_result(
+        yield self._plain_result(event, 
             f"兑换成功，已将您的群头衔设置为【{raw_title}】。"
             f"消耗 {exchange_cfg['title_cost']} {points_name}，剩余 {remaining_points} {points_name}。"
         )
@@ -2648,24 +2046,24 @@ class PointSystemPlugin(Star):
         points_name = self._get_points_name()
 
         if not exchange_cfg["essence_enabled"]:
-            yield event.plain_result("当前未开启积分兑换设精功能。")
+            yield self._plain_result(event, "当前未开启积分兑换设精功能。")
             return
 
         err = self._ensure_qq_group_exchange(event, "兑换设精")
         if err:
-            yield event.plain_result(err)
+            yield self._plain_result(event, err)
             return
 
         reply_message_id = self._extract_reply_message_id(event)
         if reply_message_id is None:
-            yield event.plain_result("请先引用一条消息，再发送 /兑换设精。")
+            yield self._plain_result(event, "请先引用一条消息，再发送 /兑换设精。")
             return
 
         success, remaining_points = await self._deduct_sender_points(
             event, exchange_cfg["essence_cost"]
         )
         if not success:
-            yield event.plain_result(
+            yield self._plain_result(event, 
                 f"积分不足，兑换设精需要 {exchange_cfg['essence_cost']} {points_name}，"
                 f"您当前仅有 {remaining_points} {points_name}。"
             )
@@ -2678,13 +2076,13 @@ class PointSystemPlugin(Star):
                 event, exchange_cfg["essence_cost"]
             )
             logger.warning(f"积分兑换设精失败，已自动退款: {exc}")
-            yield event.plain_result(
+            yield self._plain_result(event, 
                 f"兑换设精失败，已退还 {exchange_cfg['essence_cost']} {points_name}。"
                 f"当前余额：{refunded_points} {points_name}。"
             )
             return
 
-        yield event.plain_result(
+        yield self._plain_result(event, 
             f"兑换成功，目标消息已设为精华。"
             f"消耗 {exchange_cfg['essence_cost']} {points_name}，剩余 {remaining_points} {points_name}。"
         )
@@ -2696,17 +2094,17 @@ class PointSystemPlugin(Star):
         points_name = self._get_points_name()
 
         if not exchange_cfg["mute_enabled"]:
-            yield event.plain_result("当前未开启积分兑换禁言功能。")
+            yield self._plain_result(event, "当前未开启积分兑换禁言功能。")
             return
 
         err = self._ensure_qq_group_exchange(event, "兑换禁言")
         if err:
-            yield event.plain_result(err)
+            yield self._plain_result(event, err)
             return
 
         target_uid = self._extract_target_user_id(event)
         if target_uid and not exchange_cfg["allow_mute_others"]:
-            yield event.plain_result(
+            yield self._plain_result(event, 
                 "当前配置只允许兑换自禁，若要禁言他人，请在配置中开启 allow_mute_others。"
             )
             return
@@ -2715,14 +2113,14 @@ class PointSystemPlugin(Star):
             target_uid = str(event.get_sender_id())
 
         if target_uid == str(getattr(event, "get_self_id", lambda: "")()):
-            yield event.plain_result("不能对机器人本身使用兑换禁言。")
+            yield self._plain_result(event, "不能对机器人本身使用兑换禁言。")
             return
 
         success, remaining_points = await self._deduct_sender_points(
             event, exchange_cfg["mute_cost"]
         )
         if not success:
-            yield event.plain_result(
+            yield self._plain_result(event, 
                 f"积分不足，兑换禁言需要 {exchange_cfg['mute_cost']} {points_name}，"
                 f"您当前仅有 {remaining_points} {points_name}。"
             )
@@ -2739,7 +2137,7 @@ class PointSystemPlugin(Star):
                 event, exchange_cfg["mute_cost"]
             )
             logger.warning(f"积分兑换禁言失败，已自动退款: {exc}")
-            yield event.plain_result(
+            yield self._plain_result(event, 
                 f"兑换禁言失败，已退还 {exchange_cfg['mute_cost']} {points_name}。"
                 f"当前余额：{refunded_points} {points_name}。"
             )
@@ -2748,7 +2146,7 @@ class PointSystemPlugin(Star):
         target_desc = (
             "自己" if target_uid == str(event.get_sender_id()) else f"用户 {target_uid}"
         )
-        yield event.plain_result(
+        yield self._plain_result(event, 
             f"兑换成功，已禁言{target_desc} {exchange_cfg['mute_duration_seconds']} 秒。"
             f"消耗 {exchange_cfg['mute_cost']} {points_name}，剩余 {remaining_points} {points_name}。"
         )
@@ -2765,11 +2163,47 @@ class PointSystemPlugin(Star):
         async for result in self._admin_modify_points(event, is_add=False):
             yield result
 
+    @filter.command("清空所有数据")
+    async def clear_all_points_data(self, event: AstrMessageEvent):
+        """（积分管理员）清空全部积分数据。用法：/清空所有数据 确认"""
+        permission_error = await self._ensure_points_admin(event)
+        if permission_error:
+            yield self._plain_result(event, permission_error)
+            return
+
+        if self._normalize_text(self._get_command_args(event)) != "确认":
+            yield self._plain_result(
+                event,
+                "该操作会清空所有积分、抽奖、生日和群记录，请发送 /清空所有数据 确认 继续。",
+            )
+            return
+
+        log_operations, _ = self._get_admin_settings()
+        cleared_title_count = await self._clear_negative_titles_before_reset(event)
+
+        async with self._data_lock:
+            old_user_count = len(self.data.get("users", {}))
+            old_group_count = len(self.data.get("groups", {}))
+            self.data = self._new_store()
+            await self._save_data_locked()
+
+        if log_operations:
+            logger.warning(
+                f"管理员 {event.get_sender_id()} 清空了全部积分数据，重置用户 {old_user_count} 个，"
+                f"重置群 {old_group_count} 个，尝试移除头衔 {cleared_title_count} 个"
+            )
+
+        yield self._plain_result(
+            event,
+            f"已清空全部积分数据，重置 {old_user_count} 个用户、{old_group_count} 个群记录，"
+            f"并尝试移除 {cleared_title_count} 个负分头衔。",
+        )
+
     async def _admin_modify_points(self, event: AstrMessageEvent, is_add: bool):
         """积分管理员修改积分的统一处理函数"""
         permission_error = await self._ensure_points_admin(event)
         if permission_error:
-            yield event.plain_result(permission_error)
+            yield self._plain_result(event, permission_error)
             return
 
         log_operations, max_limit = self._get_admin_settings()
@@ -2778,17 +2212,17 @@ class PointSystemPlugin(Star):
         target_uid, amount = self._parse_manual_points_args(event)
 
         if amount is None or not target_uid:
-            yield event.plain_result(
+            yield self._plain_result(event, 
                 f"用法：{command_name} @用户 数量；或：{command_name} QQ号 数量"
             )
             return
 
         if amount <= 0:
-            yield event.plain_result("错误：数值必须是正整数。")
+            yield self._plain_result(event, "错误：数值必须是正整数。")
             return
 
         if amount > max_limit:
-            yield event.plain_result(
+            yield self._plain_result(event, 
                 f"错误：单次操作不能超过 {max_limit} {points_name}。"
             )
             return
@@ -2816,7 +2250,7 @@ class PointSystemPlugin(Star):
 
         await self._refresh_negative_titles_for_user(event, target_uid)
 
-        yield event.plain_result(
+        yield self._plain_result(event, 
             f"成功为用户 {target_uid} {action_str}了 {amount} {points_name}。"
             f"该用户当前总积分为：{current_points}"
         )
