@@ -130,6 +130,7 @@ class BirthdayFeatureMixin:
         return True
 
     async def _birthday_broadcast_loop(self) -> None:
+        last_attempt_date = ""
         while not self._birthday_broadcast_stop_event.is_set():
             birthday_cfg = self._get_birthday_settings()
             if not birthday_cfg["enabled"] or not birthday_cfg["auto_broadcast_enabled"]:
@@ -145,8 +146,13 @@ class BirthdayFeatureMixin:
             hour, minute = [
                 int(part) for part in birthday_cfg["auto_broadcast_time"].split(":")
             ]
-            if (now.hour, now.minute) >= (hour, minute):
+            today_iso = now.date().isoformat()
+            if (
+                (now.hour, now.minute) >= (hour, minute)
+                and last_attempt_date != today_iso
+            ):
                 await self._run_birthday_broadcast()
+                last_attempt_date = today_iso
                 now = datetime.datetime.now()
             next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if next_run <= now:
@@ -159,7 +165,7 @@ class BirthdayFeatureMixin:
                 )
                 break
             except asyncio.TimeoutError:
-                await self._run_birthday_broadcast()
+                continue
 
     async def _run_birthday_broadcast(self) -> None:
         birthday_cfg = self._get_birthday_settings()
@@ -207,13 +213,27 @@ class BirthdayFeatureMixin:
                     text = f"今日寿星名单：{names_text}，祝大家生日快乐！"
                     pending_messages.append((str(group_id), target, text))
 
-        sent_group_ids: list[str] = []
-        for group_id, target, text in pending_messages:
-            try:
-                await self.context.send_message(target, MessageChain([Plain(text)]))
-                sent_group_ids.append(group_id)
-            except Exception as exc:
-                logger.warning(f"发送生日播报失败: group={group_id}, error={exc}")
+        semaphore = asyncio.Semaphore(5)
+
+        async def _send_birthday_message(group_id: str, target: str, text: str) -> str:
+            async with semaphore:
+                try:
+                    await self.context.send_message(target, MessageChain([Plain(text)]))
+                    return group_id
+                except Exception as exc:
+                    logger.warning(f"发送生日播报失败: group={group_id}, error={exc}")
+                    return ""
+
+        sent_group_ids = [
+            group_id
+            for group_id in await asyncio.gather(
+                *(
+                    _send_birthday_message(group_id, target, text)
+                    for group_id, target, text in pending_messages
+                )
+            )
+            if group_id
+        ]
 
         if not sent_group_ids:
             return

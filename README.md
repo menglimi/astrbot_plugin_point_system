@@ -3,7 +3,7 @@
 ## 插件简介
 `astrbot_plugin_point_system` 是一个面向 AstrBot 群聊场景的积分互动插件，围绕“签到、活跃、抽奖、兑换、管理”这几类高频玩法设计。它支持按群维护成员信息、自动保存数据、定时备份、日期口令奖励，以及负分限制和群头衔联动，适合做群活跃体系或轻量积分经济。
 
-**版本：1.8.5**  
+**版本：1.8.6**  
 **展示名称：** `群积分助手`  
 **GitHub 仓库：** [https://github.com/menglimi/astrbot_plugin_point_system](https://github.com/menglimi/astrbot_plugin_point_system)
 
@@ -194,6 +194,7 @@
 - 单条词条支持 `name`、`enabled`、`priority`、`scope`、`dates`、`keywords`
 - 单条词条支持 `reward_points`、`daily_limit_per_user`、`probability`
 - 单条词条支持 `announce`、`reply_template`、`exact_match`
+- `keywords` 默认按普通文本包含匹配；如需正则，请显式使用 `re:` 前缀，并仅使用简短的安全表达式
 
 ### 备份配置
 - `backup_settings.enabled`：是否开启自动备份
@@ -271,6 +272,14 @@
 ### 1.8.5
 - 新增最小 `requirements.txt`
 - 明确插件本身无额外第三方 pip 依赖，运行依赖 AstrBot 主程序环境
+
+### 1.8.6
+- 修复用户 ID 归一化不一致导致的脏键残留问题
+- 修复引用消息提取在遇到无效 `Reply` 组件时提前返回的问题
+- 修复管理员改分污染当前群成员表的问题
+- 将日期词条关键词改为默认文本匹配，`re:` 前缀才启用受限正则，降低 ReDoS 风险
+- 优化生日播报调度，避免同一时段重复触发
+- 修复群体抽奖在人数阈值变更时可能出现的奖池分配截断问题，并补充抽奖审计日志
 
 ### 1.7.0
 - 支持负分

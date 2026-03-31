@@ -27,6 +27,8 @@ DATA_VERSION = 7
 DEFAULT_POINTS_NAME = "积分"
 GLOBAL_SIGN_IN_SCOPE_ID = "__global_sign_in__"
 DEFAULT_NEGATIVE_DEBT_MESSAGE = "你已背负债务，请穿上女仆装打工。"
+MAX_SPECIAL_REWARD_REGEX_LENGTH = 64
+MAX_SPECIAL_REWARD_MESSAGE_LENGTH = 200
 INVALID_DISPLAY_NAMES = {
     "未绑定账号",
     "未知用户",
@@ -52,8 +54,8 @@ COMMAND_TEXT_PATTERN = re.compile(
 @register(
     PLUGIN_NAME,
     "menglimi",
-    "群积分助手。支持每日签到、活跃奖励、按群排行榜，以及个人抽奖、群体抽奖、日期口令奖励和头衔/设精/禁言等互动功能。",
-    "1.8.5",
+    "astrbot_plugin_point_system 是一个面向 AstrBot 群聊场景的积分互动插件，围绕“签到、活跃、抽奖、兑换、管理”这几类高频玩法设计。它支持按群维护成员信息、自动保存数据、定时备份、日期口令奖励，以及负分限制和群头衔联动，适合做群活跃体系或轻量积分经济。",
+    "1.8.6",
     "https://github.com/menglimi/astrbot_plugin_point_system",
 )
 class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
@@ -115,6 +117,9 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
 
     def _normalize_text(self, value: Any) -> str:
         return value if isinstance(value, str) else ""
+
+    def _normalize_user_id(self, value: Any) -> str:
+        return str(value).strip()
 
     def _single_line_message(self, text: Any) -> str:
         if text is None:
@@ -390,11 +395,22 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 raw_users = {}
                 migrated = True
 
-            normalized_users = {
-                str(user_id): self._normalize_user_record(user_info)
-                for user_id, user_info in raw_users.items()
-                if str(user_id).strip()
-            }
+            normalized_users: Dict[str, Dict[str, Any]] = {}
+            for user_id, user_info in raw_users.items():
+                normalized_user_id = self._normalize_user_id(user_id)
+                if not normalized_user_id:
+                    migrated = True
+                    continue
+                if normalized_user_id != str(user_id):
+                    migrated = True
+                if normalized_user_id in normalized_users:
+                    logger.warning(
+                        f"检测到重复的用户 ID 键，已按归一化结果覆盖旧值: {user_id!r} -> {normalized_user_id!r}"
+                    )
+                    migrated = True
+                normalized_users[normalized_user_id] = self._normalize_user_record(
+                    user_info
+                )
             groups = self._normalize_group_store(raw.get("groups", {}), normalized_users)
 
             if raw.get("version") != DATA_VERSION:
@@ -405,11 +421,12 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             return store, migrated
 
         # 兼容旧版扁平结构：{user_id: user_record}
-        legacy_users = {
-            str(user_id): self._normalize_user_record(user_info)
-            for user_id, user_info in raw.items()
-            if isinstance(user_info, dict) and str(user_id).strip()
-        }
+        legacy_users: Dict[str, Dict[str, Any]] = {}
+        for user_id, user_info in raw.items():
+            normalized_user_id = self._normalize_user_id(user_id)
+            if not isinstance(user_info, dict) or not normalized_user_id:
+                continue
+            legacy_users[normalized_user_id] = self._normalize_user_record(user_info)
         store["users"] = legacy_users
         return store, True
 
@@ -889,6 +906,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             return self._single_line_message(fallback.format(**kwargs))
 
     def _get_user_record(self, user_id: str) -> Dict[str, Any]:
+        user_id = self._normalize_user_id(user_id)
         users = self.data.setdefault("users", {})
         if user_id not in users:
             users[user_id] = self._normalize_user_record({})
@@ -901,7 +919,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         group_id = event.get_group_id()
         if group_id is None:
             return ""
-        return str(group_id)
+        return self._normalize_user_id(group_id)
 
     def _get_sign_in_scope_id(self, event: AstrMessageEvent) -> str:
         return self._get_group_id(event) or GLOBAL_SIGN_IN_SCOPE_ID
@@ -937,6 +955,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         return self._safe_reply_name(sender_name)
 
     def _collect_user_group_ids(self, user_id: str) -> list[str]:
+        user_id = self._normalize_user_id(user_id)
         groups = self.data.get("groups", {})
         group_ids: list[str] = []
         for group_id, group_info in groups.items():
@@ -950,6 +969,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
     def _touch_group_member(
         self, event: AstrMessageEvent, user_id: str, display_name: str | None = None
     ) -> bool:
+        user_id = self._normalize_user_id(user_id)
         group_id = self._get_group_id(event)
         if not group_id:
             return False
@@ -998,7 +1018,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                     component, "user_id", None
                 )
                 if target_uid:
-                    return str(target_uid)
+                    return self._normalize_user_id(target_uid)
         return None
 
     def _extract_reply_message_id(self, event: AstrMessageEvent) -> int | None:
@@ -1008,8 +1028,38 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 try:
                     return int(reply_id)
                 except (TypeError, ValueError):
-                    return None
+                    continue
         return None
+
+    def _is_safe_special_reward_regex(self, pattern: str) -> bool:
+        if (
+            not pattern
+            or len(pattern) > MAX_SPECIAL_REWARD_REGEX_LENGTH
+            or any(token in pattern for token in ("(?", "\\1", "\\g<", "(", ")"))
+        ):
+            return False
+        return True
+
+    def _match_special_reward_keyword(self, keyword: str, message: str) -> bool:
+        keyword = self._normalize_text(keyword).strip()
+        if not keyword:
+            return False
+
+        if not keyword.startswith("re:"):
+            return keyword in message
+
+        pattern = keyword[3:].strip()
+        if not self._is_safe_special_reward_regex(pattern):
+            logger.warning(f"已跳过不安全的日期奖励正则关键词: {keyword!r}")
+            return False
+
+        try:
+            return bool(
+                re.search(pattern, message[:MAX_SPECIAL_REWARD_MESSAGE_LENGTH])
+            )
+        except re.error:
+            logger.warning(f"日期奖励正则关键词格式异常，已忽略: {keyword!r}")
+            return False
 
     def _get_command_args(self, event: AstrMessageEvent) -> str:
         return (event.message_str or "").partition(" ")[2].strip()
@@ -1077,12 +1127,8 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             return any(message == keyword for keyword in entry["keywords"])
 
         for keyword in entry["keywords"]:
-            try:
-                if re.search(keyword, message):
-                    return True
-            except re.error:
-                if keyword in message:
-                    return True
+            if self._match_special_reward_keyword(keyword, message):
+                return True
         return False
 
     def _format_special_reward_message(self, entry: Dict[str, Any], **kwargs: Any) -> str:
@@ -1249,11 +1295,26 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             return
         if not getattr(event, "bot", None):
             return
+        user_id = self._normalize_user_id(user_id)
 
         async with self._data_lock:
             group_ids = self._collect_user_group_ids(user_id)
             users = self.data.get("users", {})
             groups = self.data.get("groups", {})
+            target_user_info = users.get(user_id, {})
+            if (
+                target_user_info.get("points", 0) >= 0
+                and not any(
+                    self._normalize_text(
+                        groups.get(group_id, {})
+                        .get("members", {})
+                        .get(user_id, {})
+                        .get("negative_title")
+                    )
+                    for group_id in group_ids
+                )
+            ):
+                return
             planned_updates: list[tuple[str, str, str]] = []
 
             for group_id in group_ids:
@@ -1456,7 +1517,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         if not target_uid and target_part:
             uid_match = re.search(r"(\d{5,20})", target_part)
             if uid_match:
-                target_uid = uid_match.group(1)
+                target_uid = self._normalize_user_id(uid_match.group(1))
 
         return target_uid, amount
 
@@ -2238,7 +2299,6 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 user_info["points"] -= amount
                 action_str = "扣除"
 
-            self._touch_group_member(event, target_uid)
             await self._save_data_locked()
             current_points = user_info["points"]
 
