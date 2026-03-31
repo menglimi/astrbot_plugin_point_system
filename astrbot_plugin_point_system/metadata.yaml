@@ -1,6 +1,0 @@
-name: astrbot_plugin_point_system
-display_name: 群积分助手
-author: AstrBot
-description: 群积分助手。支持每日签到、活跃奖励、个人积分查询、按群排行榜，以及个人抽奖、群体抽奖、日期口令奖励、自动备份、兑换头衔、设精和禁言等群互动功能。
-version: 1.8.0
-repo: https://github.com/astrbot/astrbot_plugin_point_system
