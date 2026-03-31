@@ -224,14 +224,6 @@
 
 ---
 
-## 运行与验证
-当前目录不是 Git 仓库，且本地 Python 环境未安装 `astrbot` 模块，因此无法在当前终端完成完整运行态联调。当前已完成的本地验证如下：
-
-- `python -m py_compile main.py birthday_feature.py lottery_feature.py`
-- `_conf_schema.json` UTF-8 JSON 解析检查
-
----
-
 ## 更新记录
 
 ### 1.7.1
@@ -306,8 +298,5 @@
 
 ## 开发信息
 1. 开发者：`menglimi`
-2. 插件标识：`astrbot_plugin_point_system`
-3. 展示名称：`群积分助手`
-4. 仓库地址：[https://github.com/menglimi/astrbot_plugin_point_system](https://github.com/menglimi/astrbot_plugin_point_system)
-5. 数据目录：`<AstrBot数据目录>\plugin_data\astrbot_plugin_point_system`
-6. 当前终端环境：可完成语法与配置校验，暂不支持完整 AstrBot 运行态联调
+2. qq：995051631
+3. 欢迎提issues和pr，喜欢请给个star
