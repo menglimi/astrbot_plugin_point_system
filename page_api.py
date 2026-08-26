@@ -6,6 +6,9 @@ import copy
 import datetime
 import hashlib
 import json
+import re
+import uuid
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
@@ -13,6 +16,11 @@ from astrbot.api.web import request
 
 
 PAGE_API_PREFIX = "/astrbot_plugin_point_system/page"
+MEDIA_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
+MEDIA_EXTENSIONS = {
+    "image": {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"},
+    "video": {".mp4", ".webm", ".mov", ".m4v"},
+}
 
 SETTINGS_DEFAULTS: dict[str, Any] = {
     "points_name": "积分",
@@ -32,6 +40,8 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
         "streak_step_bonus": 2,
         "streak_bonus_cap": 10,
         "weekly_streak_bonus": 10,
+        "make_up_cost": 100,
+        "make_up_monthly_limit": 1,
     },
     "activity_settings": {
         "enabled": False,
@@ -39,6 +49,16 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
         "cooldown_seconds": 300,
         "daily_limit": 6,
         "min_text_length": 4,
+    },
+    "steal_settings": {
+        "enabled": False,
+        "daily_steal_limit": 3,
+        "daily_be_stolen_limit": 3,
+        "min_points": 1,
+        "max_points": 20,
+        "success_probability": 0.5,
+        "failure_cost": 0,
+        "failure_cost_to_victim": True,
     },
     "birthday_settings": {
         "enabled": True,
@@ -109,8 +129,15 @@ SETTINGS_MINIMUMS = {
     "sign_in_settings.streak_step_bonus": 0,
     "sign_in_settings.streak_bonus_cap": 0,
     "sign_in_settings.weekly_streak_bonus": 0,
+    "sign_in_settings.make_up_cost": 0,
+    "sign_in_settings.make_up_monthly_limit": 0,
     "activity_settings.cooldown_seconds": 0,
     "activity_settings.daily_limit": 0,
+    "steal_settings.daily_steal_limit": 0,
+    "steal_settings.daily_be_stolen_limit": 0,
+    "steal_settings.min_points": 1,
+    "steal_settings.max_points": 1,
+    "steal_settings.failure_cost": 0,
     "birthday_settings.reward_points": 0,
     "red_packet_settings.expire_minutes": 0,
 }
@@ -131,6 +158,7 @@ class PointSystemPageApi:
         routes = [
             ("/overview", self.overview, ["GET"], "Point System exchange overview"),
             ("/dashboard", self.dashboard, ["GET"], "Point System filtered dashboard"),
+            ("/media/upload", self.upload_media, ["POST"], "Point System media upload"),
             ("/items/save", self.save_items, ["POST"], "Point System save exchange items"),
             ("/settings/save", self.save_settings, ["POST"], "Point System save common settings"),
         ]
@@ -175,6 +203,19 @@ class PointSystemPageApi:
         return str(value or "").strip()[:limit]
 
     @staticmethod
+    def _request_query_value(name: str, default: Any = None) -> Any:
+        """Read a query value across AstrBot request API generations."""
+        for attribute in ("query", "args"):
+            try:
+                values = getattr(request, attribute, None)
+                getter = getattr(values, "get", None)
+                if callable(getter):
+                    return getter(name, default)
+            except (AttributeError, RuntimeError):
+                continue
+        return default
+
+    @staticmethod
     def _bool(value: Any, default: bool) -> bool:
         if isinstance(value, bool):
             return value
@@ -204,6 +245,36 @@ class PointSystemPageApi:
     def _date_text(value: Any) -> str:
         text = str(value or "").strip()
         return text[:10] if len(text) >= 10 else text
+
+    def _item_repeatable(self, item: dict[str, Any]) -> bool:
+        checker = getattr(self.plugin, "_exchange_item_repeatable", None)
+        return bool(checker(item)) if callable(checker) else bool(item.get("repeatable", False))
+
+    @staticmethod
+    def _selection_mode(value: Any) -> str:
+        return "random" if str(value or "").strip().casefold() in {"random", "rand", "随机"} else "sequential"
+
+    def _content_type(self, value: Any, contents: list[str]) -> str:
+        checker = getattr(self.plugin, "_exchange_content_type", None)
+        if callable(checker):
+            return checker(value, contents)
+        normalized = str(value or "").strip().casefold()
+        if normalized in {"text", "image", "video"}:
+            return normalized
+        detected = {self._media_kind(content) for content in contents}
+        detected.discard("")
+        return next(iter(detected)) if len(detected) == 1 else "text"
+
+    def _media_kind(self, content: Any) -> str:
+        checker = getattr(self.plugin, "_exchange_content_media", None)
+        if callable(checker):
+            return str(checker(content)[0] or "").casefold()
+        match = re.match(r"^(image|video)\s*(?:://|:|\|)\s*.+$", str(content or "").strip(), re.IGNORECASE)
+        return match.group(1).casefold() if match else ""
+
+    def _redemption_consumes_stock(self, record: dict[str, Any]) -> bool:
+        checker = getattr(self.plugin, "_exchange_redemption_consumes_stock", None)
+        return bool(checker(record)) if callable(checker) else not bool(record.get("repeatable", False))
 
     def _settings_view(self) -> dict[str, Any]:
         result = copy.deepcopy(SETTINGS_DEFAULTS)
@@ -703,20 +774,38 @@ class PointSystemPageApi:
             record.get("content_hash")
             for record in redemptions
             if isinstance(record, dict)
+            and self._redemption_consumes_stock(record)
         }
 
         item_views: list[dict[str, Any]] = []
         total_stock = 0
+        repeatable_count = 0
         enabled_count = 0
         for item in self.plugin._get_exchange_items():
-            used_count = sum(
-                1
-                for content in item["contents"]
-                if self.plugin._exchange_content_fingerprint(content)
-                in redeemed_hashes
+            if self._item_repeatable(item):
+                used_count = sum(
+                    1
+                    for record in redemptions
+                    if isinstance(record, dict)
+                    and self._text(record.get("item_name"), 120).casefold()
+                    == self._text(item.get("name"), 120).casefold()
+                )
+            else:
+                used_count = sum(
+                    1
+                    for content in item["contents"]
+                    if self.plugin._exchange_content_fingerprint(content)
+                    in redeemed_hashes
+                )
+            stock = (
+                None
+                if self._item_repeatable(item)
+                else max(len(item["contents"]) - used_count, 0)
             )
-            stock = max(len(item["contents"]) - used_count, 0)
-            total_stock += stock
+            if stock is not None:
+                total_stock += stock
+            else:
+                repeatable_count += 1
             enabled_count += int(item["enabled"])
             item_views.append(
                 {
@@ -724,6 +813,11 @@ class PointSystemPageApi:
                     "enabled": item["enabled"],
                     "cost": item["cost"],
                     "contents": item["contents"],
+                    "content_type": self._content_type(
+                        item.get("content_type"), item["contents"]
+                    ),
+                    "selection_mode": self._selection_mode(item.get("selection_mode")),
+                    "repeatable": self._item_repeatable(item),
                     "private_only": item["private_only"],
                     "success_template": item["success_template"],
                     "stock": stock,
@@ -748,6 +842,7 @@ class PointSystemPageApi:
                 "item_count": len(item_views),
                 "enabled_count": enabled_count,
                 "stock": total_stock,
+                "repeatable_count": repeatable_count,
                 "redeemed_count": len(redemptions),
                 "points_spent": sum(
                     self._int(item.get("cost"), 0, 0, 1_000_000_000)
@@ -774,8 +869,8 @@ class PointSystemPageApi:
 
     async def dashboard(self) -> dict[str, Any]:
         try:
-            group_id = self._text(request.args.get("group_id"), 120)
-            history_range = self._text(request.args.get("range"), 8)
+            group_id = self._text(self._request_query_value("group_id"), 120)
+            history_range = self._text(self._request_query_value("range"), 8)
             async with self.plugin._data_lock:
                 redemptions = self.plugin.data.get("exchange_redemptions", [])
                 if not isinstance(redemptions, list):
@@ -791,6 +886,66 @@ class PointSystemPageApi:
             return {
                 "status": "error",
                 "message": "读取积分总览失败，请稍后重试",
+                "data": {},
+            }
+
+    async def upload_media(self) -> dict[str, Any]:
+        try:
+            files = await request.files()
+            uploaded = files.get("file") if files is not None else None
+            if uploaded is None:
+                return {"status": "error", "message": "请选择要上传的图片或视频", "data": {}}
+
+            filename = self._text(getattr(uploaded, "filename", ""), 160)
+            suffix = Path(filename).suffix.casefold()
+            content_type = self._text(getattr(uploaded, "content_type", ""), 80).casefold()
+            kind = "image" if content_type.startswith("image/") else "video" if content_type.startswith("video/") else ""
+            if not kind:
+                kind = next(
+                    (candidate for candidate, extensions in MEDIA_EXTENSIONS.items() if suffix in extensions),
+                    "",
+                )
+            if not kind or suffix not in MEDIA_EXTENSIONS[kind]:
+                return {
+                    "status": "error",
+                    "message": "仅支持 PNG、JPG、GIF、WEBP 图片或 MP4、WEBM、MOV 视频",
+                    "data": {},
+                }
+
+            chunks: list[bytes] = []
+            total_size = 0
+            while True:
+                chunk = await uploaded.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MEDIA_UPLOAD_MAX_BYTES:
+                    return {
+                        "status": "error",
+                        "message": "媒体文件不能超过 50 MB",
+                        "data": {},
+                    }
+                chunks.append(chunk)
+            if not chunks:
+                return {"status": "error", "message": "不能上传空文件", "data": {}}
+
+            media_dir = Path(getattr(self.plugin, "data_dir", ".")) / "exchange_media"
+            media_dir.mkdir(parents=True, exist_ok=True)
+            target = media_dir / f"{uuid.uuid4().hex}{suffix}"
+            target.write_bytes(b"".join(chunks))
+            return {
+                "status": "ok",
+                "data": {
+                    "kind": kind,
+                    "content": f"{kind}:{target}",
+                    "filename": filename,
+                },
+            }
+        except Exception as exc:
+            logger.warning("[PointSystem] 上传兑换媒体失败: %s", exc)
+            return {
+                "status": "error",
+                "message": "上传媒体失败，请稍后重试",
                 "data": {},
             }
 
@@ -833,6 +988,18 @@ class PointSystemPageApi:
                 contents_seen.add(content)
                 contents.append(content)
 
+            raw_content_type = self._text(raw_item.get("content_type"), 20).casefold()
+            content_type = self._content_type(raw_content_type, contents)
+            if raw_content_type and raw_content_type not in {"text", "image", "video"}:
+                return [], f"“{name}”的奖励类型不受支持"
+            if raw_content_type:
+                media_types = {self._media_kind(content) for content in contents}
+                media_types.discard("")
+                if content_type == "text" and media_types:
+                    return [], f"“{name}”已选择文本类型，请移除图片/视频内容"
+                if content_type in {"image", "video"} and media_types != {content_type}:
+                    return [], f"“{name}”已选择{content_type}类型，内容必须全部是对应媒体"
+
             template = self._text(raw_item.get("success_template"), 4000)
             if not template:
                 template = (
@@ -846,6 +1013,9 @@ class PointSystemPageApi:
                     "enabled": self._bool(raw_item.get("enabled"), True),
                     "cost": self._int(raw_item.get("cost"), 100, 1, 1_000_000_000),
                     "contents": contents,
+                    "content_type": content_type,
+                    "selection_mode": self._selection_mode(raw_item.get("selection_mode")),
+                    "repeatable": self._bool(raw_item.get("repeatable"), False),
                     "private_only": self._bool(raw_item.get("private_only"), True),
                     "success_template": template,
                 }

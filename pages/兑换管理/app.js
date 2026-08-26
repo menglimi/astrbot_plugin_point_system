@@ -8,7 +8,12 @@
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
-  const uniqueLines = (value) => [...new Set(String(value || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean))];
+  const uniqueLines = (value) => {
+    const values = Array.isArray(value)
+      ? value
+      : String(value || "").split(/\r?\n/);
+    return [...new Set(values.map((item) => String(item || "").trim()).filter(Boolean))];
+  };
   const uniqueScopeLines = (value) => {
     const seen = new Set();
     return String(value || "").replace(/，/g, ",").split(/[\r\n,]+/).map((item) => item.trim()).filter((item) => {
@@ -41,6 +46,8 @@
       { path: "sign_in_settings.streak_step_bonus", label: "连签步进奖励", hint: "每连续一天增加的奖励", type: "number", min: 0 },
       { path: "sign_in_settings.streak_bonus_cap", label: "连签奖励上限", hint: "每日连签额外奖励封顶", type: "number", min: 0 },
       { path: "sign_in_settings.weekly_streak_bonus", label: "每周连签奖励", hint: "每连续 7 天额外增加", type: "number", min: 0 },
+      { path: "sign_in_settings.make_up_cost", label: "补签消耗", hint: "发送 /补签 时消耗的积分，填 0 表示免费", type: "number", min: 0 },
+      { path: "sign_in_settings.make_up_monthly_limit", label: "每月补签上限", hint: "每个用户每月最多补签次数，填 0 表示不限次数", type: "number", min: 0 },
     ] },
     { id: "activity", label: "活跃奖励", icon: "messages-square", description: "按消息活跃度自动发放积分。", fields: [
       { path: "activity_settings.enabled", label: "启用活跃奖励", hint: "群聊消息达到条件后自动获分", type: "boolean" },
@@ -48,6 +55,16 @@
       { path: "activity_settings.cooldown_seconds", label: "奖励冷却时间", hint: "同一用户两次奖励的最短间隔（秒）", type: "number", min: 0 },
       { path: "activity_settings.daily_limit", label: "每日奖励次数", hint: "填 0 表示当天不发放", type: "number", min: 0 },
       { path: "activity_settings.min_text_length", label: "最短消息长度", hint: "少于该长度的消息不计活跃", type: "number", min: 1 },
+    ] },
+    { id: "steal", label: "偷积分玩法", icon: "hand-coins", description: "控制群内偷积分的次数、范围、概率和失败惩罚。", fields: [
+      { path: "steal_settings.enabled", label: "启用偷积分", hint: "允许成员使用 /偷积分 @用户", type: "boolean" },
+      { path: "steal_settings.daily_steal_limit", label: "每日可偷次数", hint: "填 0 表示不限次数", type: "number", min: 0 },
+      { path: "steal_settings.daily_be_stolen_limit", label: "每日可被偷次数", hint: "按成功被偷次数计算，填 0 表示不限", type: "number", min: 0 },
+      { path: "steal_settings.min_points", label: "偷取积分下限", hint: "成功时随机获得的最少积分", type: "number", min: 1 },
+      { path: "steal_settings.max_points", label: "偷取积分上限", hint: "成功时随机获得的最多积分", type: "number", min: 1 },
+      { path: "steal_settings.success_probability", label: "偷取成功概率", hint: "0 到 1，例如 0.5 表示 50%", type: "number", min: 0, max: 1, step: 0.01 },
+      { path: "steal_settings.failure_cost", label: "失败扣除积分", hint: "填 0 表示失败不扣分", type: "number", min: 0 },
+      { path: "steal_settings.failure_cost_to_victim", label: "失败扣除转给被偷者", hint: "关闭后扣除积分直接从系统移除", type: "boolean" },
     ] },
     { id: "lottery", label: "抽奖规则", icon: "dices", description: "控制个人抽奖和群体抽奖的入口与成本。", fields: [
       { path: "lottery_settings.enabled", label: "启用抽奖", hint: "抽奖功能总开关", type: "boolean" },
@@ -136,6 +153,20 @@
     return result?.data ?? result;
   }
 
+  async function uploadEndpoint(path, file) {
+    const api = await bridge();
+    const url = new URL(String(path || ""), "https://astrbot-plugin-page.local/");
+    const endpoint = `page/${url.pathname.replace(/^\/+/, "")}`.replace(/\/{2,}/g, "/");
+    const result = await api.upload(endpoint, file);
+    if (result?.status === "error") {
+      const error = new Error(result.message || "上传失败");
+      error.code = result?.data?.error || result?.error || "";
+      error.data = result?.data || {};
+      throw error;
+    }
+    return result?.data ?? result;
+  }
+
   function toast(message, kind = "success") {
     const node = document.createElement("div");
     node.className = `toast ${kind}`;
@@ -196,6 +227,7 @@
   }
 
   function stockFor(item) {
+    if (item.repeatable) return Infinity;
     const used = Number(item.used_count || 0);
     return Math.max((item.contents || []).length - used, 0);
   }
@@ -221,7 +253,7 @@
 
   function updateMetrics() {
     const metrics = state.data?.metrics || {};
-    $("#stockMetric").textContent = metrics.stock ?? 0;
+    $("#stockMetric").textContent = metrics.repeatable_count ? "∞" : (metrics.stock ?? 0);
     $("#itemMetric").textContent = `${metrics.enabled_count ?? 0} / ${metrics.item_count ?? 0}`;
     $("#redeemedMetric").textContent = metrics.redeemed_count ?? 0;
     $("#spentMetric").textContent = `${metrics.points_spent ?? 0} ${state.data?.points_name || "积分"}`;
@@ -425,9 +457,10 @@
     }
     list.innerHTML = visible.map(({ item, index }) => {
       const stock = stockFor(item);
+      const stockLabel = item.repeatable ? "∞" : stock;
       return `<button class="item-row ${index === state.selected ? "active" : ""} ${item.enabled ? "" : "disabled"}" type="button" data-index="${index}">
-        <strong>${escapeHtml(item.name || "未命名兑换物")}</strong><span class="stock-pill ${stock ? "" : "empty"}">${stock}</span>
-        <small>${escapeHtml(item.cost)} ${escapeHtml(state.data?.points_name || "积分")}${item.private_only ? " · 结果私聊" : ""}</small>
+        <strong>${escapeHtml(item.name || "未命名兑换物")}</strong><span class="stock-pill ${item.repeatable || stock ? "" : "empty"}">${stockLabel}</span>
+        <small>${escapeHtml(item.cost)} ${escapeHtml(state.data?.points_name || "积分")}${item.content_type === "image" ? " · 图片" : item.content_type === "video" ? " · 视频" : " · 文本"}${item.selection_mode === "random" ? " · 随机" : " · 按序"}${item.repeatable ? " · 可重复" : ""}${item.private_only ? " · 结果私聊" : ""}</small>
       </button>`;
     }).join("");
   }
@@ -442,11 +475,15 @@
     $("#itemCost").value = item.cost || 1;
     $("#itemEnabled").checked = Boolean(item.enabled);
     $("#itemPrivate").checked = Boolean(item.private_only);
+    $("#itemContentType").value = ["text", "image", "video"].includes(item.content_type) ? item.content_type : "text";
+    $("#itemRepeatable").checked = Boolean(item.repeatable);
+    $("#itemSelectionMode").value = item.selection_mode === "random" ? "random" : "sequential";
     $("#itemContents").value = (item.contents || []).join("\n");
     $("#successTemplate").value = item.success_template || DEFAULT_TEMPLATE;
     $("#pointsNameSuffix").textContent = state.data?.points_name || "积分";
     clearValidation();
     updateStockEditor();
+    updateContentEditor();
     renderTemplatePreview();
     icons();
   }
@@ -456,17 +493,17 @@
     if (!item) return;
     const total = (item.contents || []).length;
     const used = Math.min(Number(item.used_count || 0), total);
-    const available = Math.max(total - used, 0);
-    $("#availableStock").textContent = available;
+    const available = item.repeatable ? Infinity : Math.max(total - used, 0);
+    $("#availableStock").textContent = item.repeatable ? "∞" : available;
     $("#usedStock").textContent = used;
     $("#totalStock").textContent = total;
     const meta = $("#contentMeta");
     const entered = sourceText === null ? total : String(sourceText).split(/\r?\n/).map((line) => line.trim()).filter(Boolean).length;
     const ignored = Math.max(entered - total, 0);
     meta.textContent = total
-      ? `${available} 份可用，共识别 ${total} 份${ignored ? `，忽略 ${ignored} 条重复内容` : ""}`
+      ? `${item.repeatable ? "不限" : available} 份可用，共识别 ${total} 份${ignored ? `，忽略 ${ignored} 条重复内容` : ""}`
       : "还没有可发放内容，保存后用户暂时无法兑换";
-    meta.classList.toggle("warning", available === 0);
+    meta.classList.toggle("warning", !item.repeatable && available === 0);
   }
 
   function renderTemplatePreview() {
@@ -507,7 +544,7 @@
   }
 
   function addItem(example = false) {
-    const item = { name: nextItemName(), enabled: true, cost: 100, contents: [], private_only: true, success_template: DEFAULT_TEMPLATE, stock: 0, used_count: 0, total_count: 0 };
+    const item = { name: nextItemName(), enabled: true, cost: 100, content_type: "text", contents: [], selection_mode: "sequential", repeatable: false, private_only: true, success_template: DEFAULT_TEMPLATE, stock: 0, used_count: 0, total_count: 0 };
     if (example) {
       item.name = state.draft.some((entry) => entry.name === "新人礼包示例") ? nextItemName() : "新人礼包示例";
       item.enabled = false;
@@ -550,6 +587,55 @@
     input.value = cleaned;
     input.dispatchEvent(new Event("input", { bubbles: true }));
     toast(changed ? "已移除空行和重复内容" : "内容已经整理好了");
+  }
+
+  function updateContentEditor() {
+    const item = state.draft[state.selected];
+    if (!item) return;
+    const type = ["text", "image", "video"].includes(item.content_type) ? item.content_type : "text";
+    const isMedia = type !== "text";
+    $("#textContentEditor").hidden = isMedia;
+    $("#mediaContentEditor").hidden = !isMedia;
+    $("#contentUploadInput").accept = type === "image" ? "image/*" : "video/*";
+    $("#uploadMediaButton").innerHTML = `<i data-lucide="upload"></i>上传${type === "image" ? "图片" : "视频"}`;
+    const list = $("#mediaContentList");
+    if (isMedia) {
+      list.innerHTML = (item.contents || []).map((content, index) => {
+        const source = String(content || "").replace(/^(image|video):/i, "");
+        const filename = source.split(/[\\/]/).pop() || `媒体 ${index + 1}`;
+        return `<div class="media-content-row"><span><i data-lucide="${type === "image" ? "image" : "video"}"></i><strong>${escapeHtml(filename)}</strong></span><button type="button" class="icon-button" data-remove-media="${index}" title="移除媒体" aria-label="移除媒体"><i data-lucide="x"></i></button></div>`;
+      }).join("") || '<div class="media-empty">还没有上传媒体</div>';
+    }
+    icons();
+  }
+
+  async function uploadMedia(files) {
+    const item = state.draft[state.selected];
+    if (!item || !files.length) return;
+    const button = $("#uploadMediaButton");
+    const input = $("#contentUploadInput");
+    button.disabled = true;
+    button.classList.add("loading");
+    try {
+      const contents = [...(item.contents || [])];
+      for (const file of files) {
+        const uploaded = await uploadEndpoint("media/upload", file);
+        if (uploaded?.kind !== item.content_type) {
+          throw new Error("上传文件类型与当前奖励类型不一致");
+        }
+        if (uploaded?.content) contents.push(uploaded.content);
+      }
+      item.contents = uniqueLines(contents);
+      setDirty();
+      renderEditor();
+      toast(`已上传 ${files.length} 个媒体文件`);
+    } catch (error) {
+      toast(error.message || "上传媒体失败", "error");
+    } finally {
+      button.disabled = false;
+      button.classList.remove("loading");
+      input.value = "";
+    }
   }
 
   function deleteSelected() {
@@ -895,7 +981,37 @@
     $("#itemCost").addEventListener("input", (event) => { clearValidation(); updateSelected("cost", Number(event.target.value || 0)); renderTemplatePreview(); });
     $("#itemEnabled").addEventListener("change", (event) => updateSelected("enabled", event.target.checked));
     $("#itemPrivate").addEventListener("change", (event) => updateSelected("private_only", event.target.checked));
+    $("#itemContentType").addEventListener("change", (event) => {
+      const item = state.draft[state.selected];
+      const nextType = event.target.value;
+      if (item && item.contents?.length && nextType !== item.content_type) {
+        const hasIncompatibleContent = nextType === "text"
+          ? item.contents.some((content) => /^(image|video)\s*:/i.test(String(content)))
+          : item.contents.some((content) => !new RegExp(`^${nextType}\\s*:`, "i").test(String(content)));
+        if (hasIncompatibleContent && !window.confirm("当前内容与新奖励类型不一致，切换后清空现有内容吗？")) {
+          event.target.value = item.content_type || "text";
+          return;
+        }
+        if (hasIncompatibleContent) item.contents = [];
+      }
+      updateSelected("content_type", nextType, false);
+      updateContentEditor();
+      renderEditor();
+    });
+    $("#itemRepeatable").addEventListener("change", (event) => { updateSelected("repeatable", event.target.checked); updateStockEditor(); renderItemList(); });
+    $("#itemSelectionMode").addEventListener("change", (event) => { updateSelected("selection_mode", event.target.value === "random" ? "random" : "sequential"); renderItemList(); });
     $("#itemContents").addEventListener("input", (event) => { updateSelected("contents", uniqueLines(event.target.value), false); updateStockEditor(event.target.value); renderTemplatePreview(); });
+    $("#mediaContentList").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-remove-media]");
+      if (!button) return;
+      const item = state.draft[state.selected];
+      if (!item) return;
+      item.contents.splice(Number(button.dataset.removeMedia), 1);
+      setDirty();
+      renderEditor();
+    });
+    $("#uploadMediaButton").addEventListener("click", () => $("#contentUploadInput").click());
+    $("#contentUploadInput").addEventListener("change", (event) => uploadMedia([...event.target.files]));
     $("#cleanContentsButton").addEventListener("click", normalizeContents);
     $("#successTemplate").addEventListener("input", (event) => { updateSelected("success_template", event.target.value, false); renderTemplatePreview(); });
     $("#resetTemplateButton").addEventListener("click", () => { $("#successTemplate").value = DEFAULT_TEMPLATE; updateSelected("success_template", DEFAULT_TEMPLATE, false); renderTemplatePreview(); });

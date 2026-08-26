@@ -13,7 +13,7 @@ from typing import Any, Dict
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, Plain, Reply
+from astrbot.api.message_components import At, Image, Plain, Reply, Video
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.message_type import MessageType
@@ -29,7 +29,7 @@ except ImportError:
     from lottery_feature import LotteryFeatureMixin
 
 PLUGIN_NAME = "astrbot_plugin_point_system"
-DATA_VERSION = 11
+DATA_VERSION = 13
 POINT_SNAPSHOT_BUCKET_MINUTES = 15
 POINT_SNAPSHOT_RETENTION_DAYS = 90
 POINT_SNAPSHOT_MAX_RECORDS = 10000
@@ -39,6 +39,7 @@ PRIVATE_SEND_SUCCESS = "success"
 PRIVATE_SEND_FAILED = "failed"
 PRIVATE_SEND_UNCERTAIN = "uncertain"
 DEFAULT_NEGATIVE_DEBT_MESSAGE = "你已背负债务，请穿上女仆装打工。"
+NEGATIVE_TITLE_RETRY_SECONDS = 6 * 60 * 60
 MAX_SPECIAL_REWARD_REGEX_LENGTH = 64
 MAX_SPECIAL_REWARD_MESSAGE_LENGTH = 200
 INVALID_DISPLAY_NAMES = {
@@ -78,11 +79,13 @@ REGISTERED_COMMAND_NAMES = (
     "记录生日",
     "生日签到",
     "群聊签到",
+    "补签",
     "我的积分",
     "积分规则",
     "积分榜",
     "给积分",
     "扣积分",
+    "偷积分",
     "积分红包",
     "发红包",
     "抢红包",
@@ -99,7 +102,7 @@ REGISTERED_COMMAND_NAMES_BY_LENGTH = tuple(
     PLUGIN_NAME,
     "menglimi",
     "astrbot_plugin_point_system 是一个面向 AstrBot 群聊场景的积分互动插件，围绕“签到、活跃、抽奖、兑换、管理”这几类高频玩法设计。它支持按群维护成员信息、自动保存数据、定时备份、日期口令奖励，以及负分限制和群头衔联动，适合做群活跃体系或轻量积分经济。",
-    "2.3.1",
+    "2.4.0",
     "https://github.com/menglimi/astrbot_plugin_point_system",
 )
 class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
@@ -111,6 +114,8 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         self._backup_stop_event = asyncio.Event()
         self._birthday_broadcast_task: asyncio.Task | None = None
         self._birthday_broadcast_stop_event = asyncio.Event()
+        # 头衔同步属于可选展示能力；权限不足时暂缓重试，避免每条消息重复调用失败接口。
+        self._negative_title_retry_after: dict[str, datetime.datetime] = {}
         self.page_api = None
 
         self.data_dir = StarTools.get_data_dir(PLUGIN_NAME)
@@ -344,6 +349,55 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 result.append(content)
         return result
 
+    @staticmethod
+    def _exchange_content_media(content: Any) -> tuple[str, str]:
+        """Return (kind, source) for the optional media shorthand.
+
+        Existing plain text inventory remains unchanged.  Media inventory uses
+        ``image:URL`` or ``video:URL`` so the official list-style config stays
+        backwards compatible.
+        """
+        raw = str(content or "").strip()
+        match = re.match(r"^(image|video)\s*(?:://|:|\|)\s*(.+)$", raw, re.IGNORECASE)
+        if not match:
+            return "", ""
+        source = match.group(2).strip()
+        return (match.group(1).casefold(), source) if source else ("", "")
+
+    @classmethod
+    def _exchange_content_type(cls, value: Any, contents: Any = None) -> str:
+        normalized = str(value or "").strip().casefold()
+        if normalized in {"text", "image", "video"}:
+            return normalized
+        detected = {
+            cls._exchange_content_media(content)[0]
+            for content in (contents if isinstance(contents, list) else [])
+        }
+        detected.discard("")
+        return next(iter(detected)) if len(detected) == 1 else "text"
+
+    @classmethod
+    def _exchange_content_display(cls, content: Any) -> str:
+        kind, _source = cls._exchange_content_media(content)
+        return {"image": "[图片]", "video": "[视频]"}.get(kind, str(content or ""))
+
+    @classmethod
+    def _exchange_content_components(
+        cls, message: str, content: Any
+    ) -> list[Any]:
+        components: list[Any] = [Plain(message)]
+        kind, source = cls._exchange_content_media(content)
+        if not source:
+            return components
+        if kind == "image":
+            if source.startswith(("http://", "https://")):
+                components.append(Image(file=None, url=source))
+            else:
+                components.append(Image(file=source))
+        elif kind == "video":
+            components.append(Video(file=source))
+        return components
+
     def _exchange_content_fingerprint(self, content: str) -> str:
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
@@ -482,10 +536,22 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
     async def _send_private_text(
         self, event: AstrMessageEvent, user_id: str, message: str
     ) -> str:
-        """选择单一可信路由发送私聊，避免失败回退造成重复发放。"""
+        return await self._send_private_exchange(event, user_id, message)
+
+    async def _send_private_exchange(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        message: str,
+        content: str = "",
+    ) -> str:
+        """Send text or one optional media component over one trusted route."""
         normalized_user_id = self._normalize_user_id(user_id)
         if not normalized_user_id:
             return PRIVATE_SEND_FAILED
+
+        components = self._exchange_content_components(message, content)
+        has_media = len(components) > 1
 
         target_user_id: int | str = (
             int(normalized_user_id)
@@ -497,6 +563,18 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         sender_args: tuple[Any, ...] = ()
         sender_kwargs: Dict[str, Any] = {}
         bot = getattr(event, "bot", None)
+        private_session = self._get_recorded_private_message_target(
+            event, normalized_user_id
+        )
+        context_sender = getattr(self.context, "send_message", None)
+
+        # AstrBot's normal session sender converts local Image components to
+        # Base64 before handing them to OneBot.  Prefer it for media so local
+        # uploads work in private chats as well as text rewards.
+        if has_media and private_session is not None and callable(context_sender):
+            route = "recorded_private_session"
+            sender = context_sender
+            sender_args = (private_session, MessageChain(components))
 
         platform_meta_name = self._normalize_text(
             getattr(getattr(event, "platform_meta", None), "name", "")
@@ -504,28 +582,38 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         is_aiocqhttp_event = isinstance(event, AiocqhttpMessageEvent) or (
             platform_meta_name == "aiocqhttp"
         )
-        if is_aiocqhttp_event and bot is not None:
+        if sender is None and is_aiocqhttp_event and bot is not None:
             action_sender = getattr(getattr(bot, "api", None), "call_action", None)
             direct_sender = getattr(bot, "send_private_msg", None)
             if callable(action_sender):
                 route = "onebot_call_action"
                 sender = action_sender
                 sender_args = ("send_private_msg",)
-                sender_kwargs = {"user_id": target_user_id, "message": message}
+                sender_kwargs = {
+                    "user_id": target_user_id,
+                    "message": (
+                        [component.toDict() for component in components]
+                        if has_media
+                        else message
+                    ),
+                }
             elif callable(direct_sender):
                 route = "onebot_send_private_msg"
                 sender = direct_sender
-                sender_kwargs = {"user_id": target_user_id, "message": message}
+                sender_kwargs = {
+                    "user_id": target_user_id,
+                    "message": (
+                        [component.toDict() for component in components]
+                        if has_media
+                        else message
+                    ),
+                }
 
         if sender is None:
-            private_session = self._get_recorded_private_message_target(
-                event, normalized_user_id
-            )
-            context_sender = getattr(self.context, "send_message", None)
             if private_session is not None and callable(context_sender):
                 route = "recorded_private_session"
                 sender = context_sender
-                sender_args = (private_session, MessageChain([Plain(message)]))
+                sender_args = (private_session, MessageChain(components))
 
         if sender is None:
             logger.warning(
@@ -648,16 +736,25 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
 
         redemptions: list[Dict[str, Any]] = []
         seen_hashes: set[str] = set()
+        repeatable_items = {
+            self._normalize_command_text(item.get("name")).casefold()
+            for item in self._get_exchange_items()
+            if self._exchange_item_repeatable(item)
+        }
         for item in raw:
             if not isinstance(item, dict):
                 continue
             content_hash = self._normalize_text(item.get("content_hash")).strip().lower()
-            if (
-                not re.fullmatch(r"[0-9a-f]{64}", content_hash)
-                or content_hash in seen_hashes
-            ):
+            item_name = self._normalize_text(item.get("item_name")).strip()
+            repeatable = bool(item.get("repeatable")) or (
+                item_name.casefold() in repeatable_items
+            )
+            if not re.fullmatch(r"[0-9a-f]{64}", content_hash):
                 continue
-            seen_hashes.add(content_hash)
+            if content_hash in seen_hashes and not repeatable:
+                continue
+            if not repeatable:
+                seen_hashes.add(content_hash)
             redemptions.append(
                 {
                     "redemption_id": self._normalize_text(
@@ -670,11 +767,12 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                         ).encode("utf-8")
                     ).hexdigest()[:32],
                     "content_hash": content_hash,
-                    "item_name": self._normalize_text(item.get("item_name")).strip(),
+                    "item_name": item_name,
                     "user_id": self._normalize_user_id(item.get("user_id", "")),
                     "group_id": self._normalize_user_id(item.get("group_id", "")),
                     "redeemed_at": self._normalize_text(item.get("redeemed_at")),
                     "cost": self._normalize_int(item.get("cost"), 0, minimum=0),
+                    "repeatable": repeatable,
                     "delivery_status": (
                         "uncertain"
                         if self._normalize_text(item.get("delivery_status"))
@@ -888,6 +986,12 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             "total_sign_in_days": self._normalize_int(
                 raw.get("total_sign_in_days"), 0, 0
             ),
+            "make_up_sign_in_month": self._normalize_text(
+                raw.get("make_up_sign_in_month")
+            ),
+            "make_up_sign_in_count": self._normalize_int(
+                raw.get("make_up_sign_in_count"), 0, 0
+            ),
             "first_sign_in_at": self._normalize_text(raw.get("first_sign_in_at")),
             "last_active_reward_at": self._normalize_text(
                 raw.get("last_active_reward_at")
@@ -936,6 +1040,14 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             ),
             "special_reward_claims": self._normalize_counter_map(
                 raw.get("special_reward_claims")
+            ),
+            "steal_points_date": self._normalize_text(raw.get("steal_points_date")),
+            "daily_steal_points_times": self._normalize_int(
+                raw.get("daily_steal_points_times"), 0, 0
+            ),
+            "stolen_points_date": self._normalize_text(raw.get("stolen_points_date")),
+            "daily_stolen_points_times": self._normalize_int(
+                raw.get("daily_stolen_points_times"), 0, 0
             ),
         }
 
@@ -1373,6 +1485,12 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             "weekly_streak_bonus": self._normalize_int(
                 sign_in_cfg.get("weekly_streak_bonus"), 15, minimum=0
             ),
+            "make_up_cost": self._normalize_int(
+                sign_in_cfg.get("make_up_cost"), 100, minimum=0
+            ),
+            "make_up_monthly_limit": self._normalize_int(
+                sign_in_cfg.get("make_up_monthly_limit"), 1, minimum=0
+            ),
         }
 
     def _get_activity_settings(self) -> Dict[str, Any]:
@@ -1480,7 +1598,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
     def _get_action_trigger_variants(self, action_word: str) -> list[str]:
         keyword = (
             self._get_sign_in_trigger_keyword()
-            if action_word == "签到"
+            if action_word in {"签到", "补签"}
             else self._get_lottery_trigger_keyword()
         )
         variants: list[str] = []
@@ -1498,6 +1616,20 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
 
     def _get_sign_in_triggers(self) -> list[str]:
         return self._get_action_trigger_variants("签到")
+
+    def _get_make_up_sign_in_triggers(self) -> list[str]:
+        variants = ["补签"]
+        self._append_trigger_keyword_variants(
+            variants, self._get_sign_in_trigger_keyword(), "补签"
+        )
+        legacy_keyword = self._extract_trigger_keyword(
+            self.config.get("sign_in_trigger", ""), "签到"
+        )
+        if legacy_keyword:
+            self._append_trigger_keyword_variants(
+                variants, legacy_keyword, "补签"
+            )
+        return variants
 
     def _get_lottery_triggers(self) -> list[str]:
         return self._get_action_trigger_variants("抽奖")
@@ -1523,12 +1655,15 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         candidates = self._iter_quick_action_message_candidates(event, message)
         sign_in_triggers = self._get_sign_in_triggers()
         lottery_triggers = self._get_lottery_triggers()
+        make_up_sign_in_triggers = self._get_make_up_sign_in_triggers()
 
         for candidate in candidates:
             if candidate in sign_in_triggers:
                 return "sign_in"
             if candidate in lottery_triggers:
                 return "lottery"
+            if candidate in make_up_sign_in_triggers:
+                return "make_up_sign_in"
 
         is_wake_command = bool(getattr(event, "is_at_or_wake_command", False))
         if is_wake_command:
@@ -1547,6 +1682,8 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             return "sign_in"
         if normalized in self._get_lottery_triggers():
             return "lottery"
+        if normalized in self._get_make_up_sign_in_triggers():
+            return "make_up_sign_in"
         return None
 
     def _get_leaderboard_settings(self) -> tuple[int, bool]:
@@ -1609,6 +1746,48 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                     packet_cfg.get("expire_minutes"), 1440, minimum=0
                 ),
                 525600,
+            ),
+        }
+
+    def _get_steal_settings(self) -> Dict[str, Any]:
+        """读取偷积分配置，并将范围和概率归一化到可执行值。"""
+        steal_cfg = self.config.get("steal_settings")
+        if not isinstance(steal_cfg, dict):
+            # 兼容可能采用的旧命名，便于从早期测试配置平滑迁移。
+            steal_cfg = self.config.get("steal_points_settings", {})
+        if not isinstance(steal_cfg, dict):
+            steal_cfg = {}
+
+        min_points = self._normalize_int(
+            steal_cfg.get("min_points"), 1, minimum=1
+        )
+        max_points = self._normalize_int(
+            steal_cfg.get("max_points"), 20, minimum=1
+        )
+        if max_points < min_points:
+            min_points, max_points = max_points, min_points
+
+        return {
+            "enabled": bool(steal_cfg.get("enabled", False)),
+            "daily_steal_limit": self._normalize_int(
+                steal_cfg.get("daily_steal_limit"), 3, minimum=0
+            ),
+            "daily_be_stolen_limit": self._normalize_int(
+                steal_cfg.get("daily_be_stolen_limit"), 3, minimum=0
+            ),
+            "min_points": min_points,
+            "max_points": max_points,
+            "success_probability": min(
+                self._normalize_float(
+                    steal_cfg.get("success_probability"), 0.5, minimum=0.0
+                ),
+                1.0,
+            ),
+            "failure_cost": self._normalize_int(
+                steal_cfg.get("failure_cost"), 0, minimum=0
+            ),
+            "failure_cost_to_victim": bool(
+                steal_cfg.get("failure_cost_to_victim", True)
             ),
         }
 
@@ -1781,6 +1960,11 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                     "enabled": bool(raw_item.get("enabled", True)),
                     "cost": self._normalize_int(raw_item.get("cost"), 100, minimum=1),
                     "contents": contents,
+                    "content_type": self._exchange_content_type(
+                        raw_item.get("content_type"), contents
+                    ),
+                    "selection_mode": self._exchange_selection_mode(raw_item.get("selection_mode")),
+                    "repeatable": bool(raw_item.get("repeatable", False)),
                     "private_only": bool(raw_item.get("private_only", True)),
                     "success_template": self._normalize_text(
                         raw_item.get("success_template")
@@ -1792,6 +1976,33 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 }
             )
         return items
+
+    @staticmethod
+    def _exchange_selection_mode(value: Any) -> str:
+        normalized = str(value or "").strip().casefold()
+        return "random" if normalized in {"random", "rand", "随机"} else "sequential"
+
+    def _exchange_item_repeatable(self, item: Dict[str, Any]) -> bool:
+        return bool(item.get("repeatable", False))
+
+    def _exchange_redemption_consumes_stock(
+        self,
+        redemption: Dict[str, Any],
+        items_by_name: Dict[str, Dict[str, Any]] | None = None,
+    ) -> bool:
+        if items_by_name is None:
+            items_by_name = {
+                str(item.get("name", "")).casefold(): item
+                for item in self._get_exchange_items()
+            }
+        item = items_by_name.get(
+            self._normalize_command_text(redemption.get("item_name")).casefold()
+        )
+        if self._exchange_item_repeatable(item or {}):
+            return False
+        if "repeatable" in redemption:
+            return not bool(redemption.get("repeatable"))
+        return not self._exchange_item_repeatable(item or {})
 
     def _get_exchange_scope(self) -> Dict[str, Any]:
         """读取自定义兑换物的全局适用范围。"""
@@ -2434,6 +2645,11 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             planned_updates: list[tuple[str, str, str]] = []
 
             for group_id in group_ids:
+                retry_after = getattr(self, "_negative_title_retry_after", {}).get(
+                    str(group_id)
+                )
+                if retry_after and datetime.datetime.now() < retry_after:
+                    continue
                 group_info = groups.get(group_id, {})
                 members = group_info.get("members", {})
                 if not isinstance(members, dict):
@@ -2472,7 +2688,10 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             return
 
         successful_updates: list[tuple[str, str, str]] = []
+        failed_groups: set[str] = set()
         for group_id, member_user_id, desired_title in planned_updates:
+            if group_id in failed_groups:
+                continue
             try:
                 await event.bot.set_group_special_title(
                     group_id=int(group_id),
@@ -2482,8 +2701,18 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 )
                 successful_updates.append((group_id, member_user_id, desired_title))
             except Exception as exc:
+                retry_after_map = getattr(self, "_negative_title_retry_after", None)
+                if retry_after_map is None:
+                    retry_after_map = {}
+                    self._negative_title_retry_after = retry_after_map
+                retry_after_map[group_id] = datetime.datetime.now() + datetime.timedelta(
+                    seconds=NEGATIVE_TITLE_RETRY_SECONDS
+                )
+                failed_groups.add(group_id)
                 logger.warning(
-                    f"同步负分头衔失败: group={group_id}, user={member_user_id}, title={desired_title!r}, error={exc}"
+                    f"同步负分头衔失败，已暂停该群重试 {NEGATIVE_TITLE_RETRY_SECONDS // 3600} 小时；"
+                    f"不影响签到和积分恢复: group={group_id}, user={member_user_id}, "
+                    f"title={desired_title!r}, error={exc}"
                 )
 
         if not successful_updates:
@@ -2499,6 +2728,10 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 )
                 if isinstance(member_info, dict):
                     member_info["negative_title"] = desired_title
+            retry_after_map = getattr(self, "_negative_title_retry_after", None)
+            if retry_after_map is not None:
+                for group_id, _, _ in successful_updates:
+                    retry_after_map.pop(group_id, None)
             await self._save_data_locked()
 
     async def _clear_negative_titles_before_reset(self, event: AstrMessageEvent) -> int:
@@ -2843,7 +3076,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
 
         await self._refresh_negative_titles_for_user(event, user_id)
 
-        yield self._plain_result(event, 
+        yield self._plain_result(event,
             self._single_line_message(
                 self._format_msg(
                 "sign_in_success",
@@ -2870,10 +3103,257 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             )
         )
 
+    async def _handle_make_up_sign_in(self, event: AstrMessageEvent):
+        """补上最近一个漏签日，只恢复签到记录，不重复发放签到奖励。"""
+        user_id = str(event.get_sender_id())
+        now = datetime.datetime.now()
+        today_date = self._get_sign_in_business_date(now)
+        today = today_date.isoformat()
+        target_date = today_date - datetime.timedelta(days=1)
+        target = target_date.isoformat()
+        previous_target = (target_date - datetime.timedelta(days=1)).isoformat()
+        month_key = today_date.strftime("%Y-%m")
+        reply_name = self._get_sender_reply_name(event)
+        points_name = self._get_points_name()
+        sign_cfg = self._get_sign_in_settings()
+        cost = sign_cfg["make_up_cost"]
+        monthly_limit = sign_cfg["make_up_monthly_limit"]
+        already_today = False
+
+        async with self._data_lock:
+            user_info = self._get_user_record(user_id)
+            group_member_changed = self._touch_group_member(
+                event, user_id, self._get_sender_display_name(event)
+            )
+
+            last_sign_in = self._normalize_text(user_info.get("last_sign_in"))
+            try:
+                last_sign_in_date = datetime.date.fromisoformat(last_sign_in)
+            except ValueError:
+                last_sign_in_date = None
+
+            if last_sign_in_date == target_date:
+                if group_member_changed:
+                    await self._save_data_locked()
+                yield self._plain_result(event, f"{reply_name}昨天已经签到过了，不需要补签。")
+                return
+
+            if last_sign_in_date == today_date:
+                if user_info["streak"] > 1:
+                    if group_member_changed:
+                        await self._save_data_locked()
+                    yield self._plain_result(event, f"{reply_name}昨天已经包含在连续签到里了，不需要补签。")
+                    return
+                already_today = True
+            elif last_sign_in_date is not None and last_sign_in_date > today_date:
+                if group_member_changed:
+                    await self._save_data_locked()
+                yield self._plain_result(event, "签到记录日期异常，暂时无法补签，请联系管理员检查数据。")
+                return
+
+            usage_month = self._normalize_text(user_info.get("make_up_sign_in_month"))
+            usage_count = self._normalize_int(
+                user_info.get("make_up_sign_in_count"), 0, minimum=0
+            )
+            if usage_month != month_key:
+                usage_count = 0
+
+            if monthly_limit > 0 and usage_count >= monthly_limit:
+                if group_member_changed:
+                    await self._save_data_locked()
+                yield self._plain_result(
+                    event,
+                    f"{reply_name}本月补签次数已用完（{monthly_limit} 次），下月再来吧。",
+                )
+                return
+
+            if cost > 0 and user_info["points"] < cost:
+                if group_member_changed:
+                    await self._save_data_locked()
+                yield self._plain_result(
+                    event,
+                    f"积分不足，补签需要 {cost} {points_name}，你当前只有 {user_info['points']} {points_name}。",
+                )
+                return
+
+            user_info["points"] -= cost
+            user_info["make_up_sign_in_month"] = month_key
+            user_info["make_up_sign_in_count"] = usage_count + 1
+            user_info["total_sign_in_days"] += 1
+            if not user_info["first_sign_in_at"]:
+                user_info["first_sign_in_at"] = target
+
+            if already_today:
+                user_info["streak"] = max(user_info["streak"], 1) + 1
+            else:
+                user_info["streak"] = (
+                    user_info["streak"] + 1
+                    if last_sign_in_date is not None
+                    and last_sign_in_date.isoformat() == previous_target
+                    else 1
+                )
+                user_info["last_sign_in"] = target
+
+            await self._save_data_locked()
+            remaining_points = user_info["points"]
+            streak = user_info["streak"]
+            used_count = user_info["make_up_sign_in_count"]
+
+        await self._refresh_negative_titles_for_user(event, user_id)
+        limit_text = (
+            f"本月已补签 {used_count}/{monthly_limit} 次。"
+            if monthly_limit > 0
+            else f"本月已补签 {used_count} 次。"
+        )
+        yield self._plain_result(
+            event,
+            f"{reply_name}补签成功，已补上 {target}，消耗 {cost} {points_name}，"
+            f"当前有 {remaining_points} {points_name}，已连签 {streak} 天。{limit_text}",
+        )
+
+    async def _handle_steal_points(self, event: AstrMessageEvent):
+        """在群聊中尝试从指定用户处偷取积分。"""
+        settings = self._get_steal_settings()
+        points_name = self._get_points_name()
+        sender_id = self._normalize_user_id(event.get_sender_id())
+        reply_name = self._get_sender_reply_name(event)
+        group_id = self._get_group_id(event)
+
+        if not settings["enabled"]:
+            yield self._plain_result(event, "偷积分功能当前未开启，请联系管理员调整配置。")
+            return
+        if not group_id:
+            yield self._plain_result(event, "偷积分仅支持群聊中使用。")
+            return
+
+        target_uid = self._extract_target_user_id(event)
+        if not target_uid:
+            target_match = re.search(r"\d{1,20}", self._get_command_args(event))
+            if target_match:
+                target_uid = self._normalize_user_id(target_match.group(0))
+        if not target_uid:
+            yield self._plain_result(
+                event, "请指定要偷积分的用户，例如：/偷积分 @用户 或 /偷积分 QQ号。"
+            )
+            return
+        if target_uid == sender_id:
+            yield self._plain_result(event, "不能偷自己的积分。")
+            return
+
+        today = self._get_sign_in_business_date_str()
+        async with self._data_lock:
+            sender = self._get_user_record(sender_id)
+            victim = self._get_user_record(target_uid)
+            group_member_changed = self._touch_group_member(
+                event, sender_id, self._get_sender_display_name(event)
+            )
+            # 每日计数随签到业务日刷新，避免额外的定时任务和旧数据膨胀。
+            if sender.get("steal_points_date") != today:
+                sender["steal_points_date"] = today
+                sender["daily_steal_points_times"] = 0
+            if victim.get("stolen_points_date") != today:
+                victim["stolen_points_date"] = today
+                victim["daily_stolen_points_times"] = 0
+
+            used_times = self._normalize_int(
+                sender.get("daily_steal_points_times"), 0, 0
+            )
+            stolen_times = self._normalize_int(
+                victim.get("daily_stolen_points_times"), 0, 0
+            )
+            if (
+                settings["daily_steal_limit"] > 0
+                and used_times >= settings["daily_steal_limit"]
+            ):
+                if group_member_changed:
+                    await self._save_data_locked()
+                yield self._plain_result(
+                    event,
+                    f"{reply_name}今天已经偷过 {used_times} 次了，明天再来吧。",
+                )
+                return
+            if (
+                settings["daily_be_stolen_limit"] > 0
+                and stolen_times >= settings["daily_be_stolen_limit"]
+            ):
+                if group_member_changed:
+                    await self._save_data_locked()
+                yield self._plain_result(
+                    event,
+                    f"这个用户今天已经被偷 {stolen_times} 次了，先放过他吧。",
+                )
+                return
+
+            sender_before = sender["points"]
+            victim_before = victim["points"]
+            sender_times_before = used_times
+            victim_times_before = stolen_times
+            sender_date_before = sender.get("steal_points_date", "")
+            victim_date_before = victim.get("stolen_points_date", "")
+            sender["daily_steal_points_times"] = used_times + 1
+            sender["steal_points_date"] = today
+            victim["stolen_points_date"] = today
+
+            success = (
+                victim["points"] > 0
+                and random.random() < settings["success_probability"]
+            )
+            if success:
+                amount = random.randint(
+                    settings["min_points"], settings["max_points"]
+                )
+                amount = min(amount, victim["points"])
+                sender["points"] += amount
+                victim["points"] -= amount
+                victim["daily_stolen_points_times"] = victim_times_before + 1
+                result_text = (
+                    f"{reply_name}出手成功，从用户 {target_uid} 那里偷到 {amount} {points_name}！"
+                    f"你现在有 {sender['points']} {points_name}。"
+                )
+            else:
+                cost = settings["failure_cost"]
+                sender["points"] -= cost
+                if settings["failure_cost_to_victim"] and cost > 0:
+                    victim["points"] += cost
+                result_text = f"{reply_name}偷积分失败。"
+                if cost > 0:
+                    result_text += f"扣除 {cost} {points_name}"
+                    if settings["failure_cost_to_victim"]:
+                        result_text += f"，已转给被偷者"
+                    result_text += f"，你现在有 {sender['points']} {points_name}。"
+
+            save_ok = await self._save_data_locked()
+            if save_ok is False:
+                sender["points"] = sender_before
+                victim["points"] = victim_before
+                sender["daily_steal_points_times"] = sender_times_before
+                victim["daily_stolen_points_times"] = victim_times_before
+                sender["steal_points_date"] = sender_date_before
+                victim["stolen_points_date"] = victim_date_before
+                yield self._plain_result(
+                    event, "偷积分记录保存失败，本次操作未生效，请稍后再试。"
+                )
+                return
+
+        await self._refresh_negative_titles_for_user(event, sender_id)
+        yield self._plain_result(event, result_text)
+
     @filter.command("群聊签到")
     async def sign_in(self, event: AstrMessageEvent):
         """每日签到以获取积分奖励。"""
         async for result in self._handle_sign_in(event):
+            yield result
+
+    @filter.command("补签")
+    async def make_up_sign_in(self, event: AstrMessageEvent):
+        """消耗积分补上最近一个漏签日。"""
+        async for result in self._handle_make_up_sign_in(event):
+            yield result
+
+    @filter.command("偷积分")
+    async def steal_points(self, event: AstrMessageEvent):
+        """按配置概率从指定群成员处尝试偷取积分。"""
+        async for result in self._handle_steal_points(event):
             yield result
 
     @filter.command("抽奖")
@@ -2933,6 +3413,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         sign_cfg = self._get_sign_in_settings()
         birthday_cfg = self._get_birthday_settings()
         activity_cfg = self._get_activity_settings()
+        steal_cfg = self._get_steal_settings()
         lottery_cfg = self._get_lottery_settings()
         special_reward_entries = self._get_special_date_reward_entries()
         exchange_items = [
@@ -2941,6 +3422,9 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         sign_in_triggers = self._get_sign_in_triggers()
         lottery_triggers = self._get_lottery_triggers()
         sign_in_examples = " / ".join(f"“{item}”" for item in sign_in_triggers[:2])
+        make_up_examples = " / ".join(
+            f"“{item}”" for item in self._get_make_up_sign_in_triggers()[:3]
+        )
         lottery_examples = " / ".join(f"“{item}”" for item in lottery_triggers[:2])
 
         lines = [
@@ -2995,14 +3479,41 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         else:
             lines.append("8. 群聊活跃奖励：当前未开启")
 
-        lines.append(f"9. 无前缀签到：发送 {sign_in_examples} 也可以直接签到")
+        if steal_cfg["enabled"]:
+            steal_limit_text = (
+                f"每天最多 {steal_cfg['daily_steal_limit']} 次"
+                if steal_cfg["daily_steal_limit"] > 0
+                else "每天不限次数"
+            )
+            be_stolen_limit_text = (
+                f"每人每天最多被成功偷 {steal_cfg['daily_be_stolen_limit']} 次"
+                if steal_cfg["daily_be_stolen_limit"] > 0
+                else "每人每天被偷次数不限"
+            )
+            lines.append(
+                f"9. 偷积分：{steal_limit_text}，{be_stolen_limit_text}，"
+                f"成功率 {steal_cfg['success_probability'] * 100:.1f}%，"
+                f"成功随机获得 {steal_cfg['min_points']}~{steal_cfg['max_points']} {points_name}"
+            )
+        else:
+            lines.append("9. 偷积分：当前未开启")
+
+        lines.append(f"10. 无前缀签到：发送 {sign_in_examples} 也可以直接签到")
+        lines.append(
+            f"补签：发送 /补签 或 {make_up_examples} 可补上最近漏签的一天，消耗 {sign_cfg['make_up_cost']} {points_name}，"
+            + (
+                f"每月最多 {sign_cfg['make_up_monthly_limit']} 次"
+                if sign_cfg["make_up_monthly_limit"] > 0
+                else "每月不限次数"
+            )
+        )
         if birthday_cfg["enabled"] and birthday_cfg["reward_points"] > 0:
             lines.append(
-                f"10. 生日签到：发送“{birthday_cfg['sign_in_trigger']}”可获得 {birthday_cfg['reward_points']} {points_name}，每人每年一次"
+                f"11. 生日签到：发送“{birthday_cfg['sign_in_trigger']}”可获得 {birthday_cfg['reward_points']} {points_name}，每人每年一次"
             )
             if birthday_cfg["auto_broadcast_enabled"]:
                 lines.append(
-                    f"11. 生日播报：每天 {birthday_cfg['auto_broadcast_time']} 自动检查并播报当日寿星名单"
+                    f"12. 生日播报：每天 {birthday_cfg['auto_broadcast_time']} 自动检查并播报当日寿星名单"
                 )
 
         if lottery_cfg["enabled"]:
@@ -3019,27 +3530,27 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                     f"满 {lottery_cfg['group_required_participants']} 人开奖"
                 )
             lines.append(
-                "12. 积分抽奖："
+                "13. 积分抽奖："
                 + "；".join(mode_lines)
                 + f"；默认模式：{'个人抽奖' if lottery_cfg['default_mode'] == 'personal' else '群体抽奖'}"
             )
-            lines.append(f"13. 无前缀抽奖：发送 {lottery_examples} 也可直接参与默认模式抽奖")
+            lines.append(f"14. 无前缀抽奖：发送 {lottery_examples} 也可直接参与默认模式抽奖")
         if special_reward_entries:
             enabled_entry_count = len(
                 [entry for entry in special_reward_entries if entry["enabled"]]
             )
-            lines.append(f"14. 日期口令奖励：当前启用 {enabled_entry_count} 条词条")
+            lines.append(f"15. 日期口令奖励：当前启用 {enabled_entry_count} 条词条")
         if exchange_items:
             lines.append(
-                f"15. 自定义兑换物：当前有 {len(exchange_items)} 种，"
+                f"16. 自定义兑换物：当前有 {len(exchange_items)} 种，"
                 "发送 /兑换列表 查看价格和库存"
             )
         if self._get_red_packet_settings()["enabled"]:
             lines.append("积分红包：管理员可发送固定、拼手气或口令红包，群成员发送 /抢红包 编号领取")
-        negative_rule_no = 16 if exchange_items else 15
+        negative_rule_no = 17 if exchange_items else 16
         lines.append(
             f"{negative_rule_no}. 负分规则：负分用户只能通过每日签到恢复积分，无法参与抽奖；"
-            "在已记录群聊中会自动佩戴“群女仆X号”头衔，转正后自动移除。"
+            "在已记录群聊中会尽力佩戴“群女仆X号”头衔，转正后自动移除；权限不足时不影响签到恢复。"
         )
         yield self._plain_result(event, "；".join(lines))
 
@@ -3059,6 +3570,11 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         if quick_action == "sign_in":
             event.stop_event()
             async for result in self._handle_sign_in(event):
+                yield result.stop_event()
+            return
+        if quick_action == "make_up_sign_in":
+            event.stop_event()
+            async for result in self._handle_make_up_sign_in(event):
                 yield result.stop_event()
             return
         if quick_action == "lottery":
@@ -3289,19 +3805,24 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 item.get("content_hash")
                 for item in self.data.get("exchange_redemptions", [])
                 if isinstance(item, dict)
+                and self._exchange_redemption_consumes_stock(item)
             }
             lines = ["【积分兑换列表】"]
             available_count = 0
             for index, item in enumerate(items, start=1):
-                stock = sum(
-                    1
-                    for content in item["contents"]
-                    if self._exchange_content_fingerprint(content)
-                    not in redeemed_hashes
+                stock = (
+                    None
+                    if self._exchange_item_repeatable(item)
+                    else sum(
+                        1
+                        for content in item["contents"]
+                        if self._exchange_content_fingerprint(content)
+                        not in redeemed_hashes
+                    )
                 )
-                if stock:
+                if stock is None or stock:
                     available_count += 1
-                stock_text = f"库存 {stock}" if stock else "暂时缺货"
+                stock_text = "库存不限" if stock is None else (f"库存 {stock}" if stock else "暂时缺货")
                 private_hint = " · 结果私聊" if item["private_only"] else ""
                 lines.append(
                     f"{index}. {item['name']}：{item['cost']} {points_name} · "
@@ -3391,11 +3912,20 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 record.get("content_hash")
                 for record in redemptions
                 if isinstance(record, dict)
+                and self._exchange_redemption_consumes_stock(record)
             }
-            for content in item["contents"]:
-                if self._exchange_content_fingerprint(content) not in redeemed_hashes:
-                    delivered_content = content
-                    break
+            available_contents = [
+                content
+                for content in item["contents"]
+                if self._exchange_item_repeatable(item)
+                or self._exchange_content_fingerprint(content) not in redeemed_hashes
+            ]
+            if available_contents:
+                delivered_content = (
+                    random.choice(available_contents)
+                    if self._exchange_selection_mode(item.get("selection_mode")) == "random"
+                    else available_contents[0]
+                )
 
             if not delivered_content:
                 result_error = (
@@ -3424,6 +3954,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                     "group_id": self._get_group_id(event) or "",
                     "redeemed_at": now,
                     "cost": item["cost"],
+                    "repeatable": self._exchange_item_repeatable(item),
                     "delivery_status": (
                         "pending" if should_private_deliver else "delivered"
                     ),
@@ -3451,14 +3982,14 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         message = self._format_exchange_success_message(
             item["success_template"],
             item["name"],
-            delivered_content,
+            self._exchange_content_display(delivered_content),
             item["cost"],
             points_name,
             remaining_points,
         )
         if should_private_deliver:
-            private_send_status = await self._send_private_text(
-                event, sender_id, message
+            private_send_status = await self._send_private_exchange(
+                event, sender_id, message, delivered_content
             )
             if private_send_status == PRIVATE_SEND_FAILED:
                 rolled_back = bool(
@@ -3510,7 +4041,12 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             )
             return
 
-        yield event.plain_result(message)
+        media_components = self._exchange_content_components(message, delivered_content)
+        chain_result = getattr(event, "chain_result", None)
+        if len(media_components) > 1 and callable(chain_result):
+            yield chain_result(media_components)
+        else:
+            yield event.plain_result(message)
 
     @filter.command("兑换设精")
     async def exchange_essence(self, event: AstrMessageEvent):

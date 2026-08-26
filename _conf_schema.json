@@ -128,6 +128,18 @@
         "type": "int",
         "hint": "每逢连续签到第 7、14、21... 天时额外获得的奖励。",
         "default": 15
+      },
+      "make_up_cost": {
+        "description": "补签消耗",
+        "type": "int",
+        "hint": "发送 /补签 时消耗的积分；填 0 表示免费补签。",
+        "default": 100
+      },
+      "make_up_monthly_limit": {
+        "description": "每月补签上限",
+        "type": "int",
+        "hint": "每个用户每月最多补签次数；填 0 表示不限次数。",
+        "default": 1
       }
     }
   },
@@ -164,6 +176,60 @@
         "type": "int",
         "hint": "消息纯文本少于该长度时，不计入活跃奖励。",
         "default": 4
+      }
+    }
+  },
+  "steal_settings": {
+    "description": "偷积分设置",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "是否开启偷积分",
+        "type": "bool",
+        "hint": "开启后，用户可在群聊中使用 /偷积分 @用户 尝试偷取积分。",
+        "default": false
+      },
+      "daily_steal_limit": {
+        "description": "每人每日可偷次数",
+        "type": "int",
+        "hint": "单个用户每天最多发起多少次偷积分；填 0 表示不限次数。",
+        "default": 3
+      },
+      "daily_be_stolen_limit": {
+        "description": "每人每日可被偷次数",
+        "type": "int",
+        "hint": "单个用户每天最多被成功偷取多少次；填 0 表示不限次数。",
+        "default": 3
+      },
+      "min_points": {
+        "description": "偷取积分下限",
+        "type": "int",
+        "hint": "偷取成功时随机获得的最少积分。",
+        "default": 1
+      },
+      "max_points": {
+        "description": "偷取积分上限",
+        "type": "int",
+        "hint": "偷取成功时随机获得的最多积分，实际不会超过被偷者余额。",
+        "default": 20
+      },
+      "success_probability": {
+        "description": "偷取成功概率",
+        "type": "float",
+        "hint": "填写 0 到 1 之间的小数，例如 0.5 表示 50% 成功率。",
+        "default": 0.5
+      },
+      "failure_cost": {
+        "description": "偷取失败扣除积分",
+        "type": "int",
+        "hint": "偷取失败时从发起者扣除的积分，填 0 表示失败不扣分。",
+        "default": 0
+      },
+      "failure_cost_to_victim": {
+        "description": "失败扣除是否转给被偷者",
+        "type": "bool",
+        "hint": "开启后，失败扣除的积分会转给被偷者；关闭则积分直接从系统中扣除。",
+        "default": true
       }
     }
   },
@@ -597,6 +663,37 @@
       }
     }
   },
+  "red_packet_settings": {
+    "description": "积分红包设置",
+    "type": "object",
+    "hint": "管理员可在群里创建固定、拼手气或口令红包；红包由系统发放，不扣管理员个人积分。",
+    "items": {
+      "enabled": {
+        "description": "是否开启积分红包",
+        "type": "bool",
+        "hint": "关闭后管理员不能创建新红包，已经发出的红包仍可按原规则领取。",
+        "default": true
+      },
+      "max_total_points": {
+        "description": "单个红包积分上限",
+        "type": "int",
+        "hint": "用于减少误操作；需要更大额度时可按实际活动规模调整。",
+        "default": 100000
+      },
+      "max_count": {
+        "description": "单个红包最多份数",
+        "type": "int",
+        "hint": "固定、拼手气和口令红包都受此上限保护。",
+        "default": 100
+      },
+      "expire_minutes": {
+        "description": "红包有效时长（分钟）",
+        "type": "int",
+        "hint": "默认 1440 分钟（24 小时）；填 0 表示不过期。过期红包不会再发放剩余积分。",
+        "default": 1440
+      }
+    }
+  },
   "exchange_items": {
     "description": "自定义兑换物（首次使用先配置这里）",
     "type": "template_list",
@@ -623,11 +720,29 @@
             "hint": "每成功兑换一次扣除的积分。首次测试时可设置为测试用户容易获得的数值，确认流程后再调整。",
             "default": 100
           },
+          "content_type": {
+            "description": "奖励类型",
+            "type": "string",
+            "hint": "text 文本、image 图片、video 视频；管理页会按类型显示对应编辑区。",
+            "default": "text"
+          },
           "contents": {
             "description": "发放内容（每项是一份库存）",
             "type": "list",
-            "hint": "建议先添加一份测试内容。每个列表项是一份一次性库存，成功发放后不会再次发出；可填写兑换码、领取凭证、链接、口令或其他文本，同一内容不要在多个兑换物中重复。留空可保存，但库存为 0 时用户无法兑换。",
+            "hint": "每行一份内容，默认按文本发送；也可填写 image:https://图片地址 或 video:https://视频地址 发送媒体。默认每行只发放一次；留空可保存，但没有内容时用户无法兑换。",
             "default": []
+          },
+          "repeatable": {
+            "description": "允许重复兑换",
+            "type": "bool",
+            "hint": "开启后不消耗库存，用户每次兑换都会再次获得同一份内容；适合永久链接、电子资料或权益类兑换物。",
+            "default": false
+          },
+          "selection_mode": {
+            "description": "内容发放顺序",
+            "type": "string",
+            "hint": "sequential 按内容列表顺序发放；random 每次从可用内容中随机抽取。随机模式关闭允许重复兑换时，抽到的内容发放后会从库存中移除。",
+            "default": "sequential"
           },
           "private_only": {
             "description": "通过私聊发放结果",

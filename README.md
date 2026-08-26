@@ -3,7 +3,7 @@
 ## 插件简介
 `astrbot_plugin_point_system` 是一个面向 AstrBot 群聊场景的积分互动插件，围绕“签到、活跃、抽奖、兑换、管理”这几类高频玩法设计。它支持按群维护成员信息、自动保存数据、定时备份、日期口令奖励，以及负分限制和群头衔联动，适合做群活跃体系或轻量积分经济。
 
-**版本：2.3.1**
+**版本：2.4.0**
 
 **展示名称：** `群积分助手`  
 **GitHub 仓库：** [https://github.com/menglimi/astrbot_plugin_point_system](https://github.com/menglimi/astrbot_plugin_point_system)
@@ -56,7 +56,9 @@
 ```
 
 - `name` 是用户看到和输入的兑换物名称，可自由命名；名称应便于区分
-- `contents` 中每一项代表一份库存，成功发放后不会再次发放；可填写兑换码、领取凭证、链接、口令或其他文本，同一内容不要在多个兑换物中重复使用
+- `contents` 中每一项代表一份库存，默认成功发放后不会再次发放；可填写兑换码、领取凭证、链接、口令或其他文本，也可使用 `image:https://...` 或 `video:https://...` 发送图片/视频
+- `repeatable` 开启后不消耗库存，用户每次兑换都会再次获得同一份内容，适合长期有效的链接、资料或权益
+- `selection_mode` 可填 `sequential`（按内容列表顺序）或 `random`（从可用内容中随机抽取）；随机模式关闭 `repeatable` 时，抽中的内容兑换后销毁
 - `private_only` 默认建议开启；用户仍在群里发起兑换，Bot 会把完整兑换结果私聊发送，发放内容可以公开时可关闭
 - `success_template` 可以直接保留默认值，也可以按需修改兑换成功提示
 - `contents` 为空时会显示库存为 0，用户无法兑换，但不会扣除积分
@@ -87,7 +89,7 @@
 - 日期口令奖励：支持按日期、关键词、范围、概率发放奖励
 - 生日系统：支持记录生日、生日签到奖励，以及按配置时间自动播报当日寿星名单
 - 自动备份：支持多备份目标和每日定时备份
-- 负分联动：负分用户仅可签到恢复积分，不能抽奖，并自动同步 `群女仆X号` 头衔
+- 负分联动：负分用户仅可签到恢复积分，不能抽奖，并尽力同步 `群女仆X号` 头衔
 
 ---
 
@@ -118,7 +120,7 @@
 - 负分用户只能通过每日签到恢复积分
 - 负分用户无法参与抽奖
 - 负分用户不会获得活跃奖励和日期口令奖励
-- 在 QQ / AIOCQHTTP 群聊中，负分用户会自动同步 `群女仆X号` 头衔，转正后自动移除
+- 在 QQ / AIOCQHTTP 群聊中，负分用户会尽力同步 `群女仆X号` 头衔，转正后自动移除；若 Bot 没有群主权限，头衔同步会跳过并延迟重试，不影响每日签到恢复积分
 
 ---
 
@@ -138,6 +140,7 @@
 | 指令 | 说明 | 示例 |
 | :--- | :--- | :--- |
 | `/群聊签到` | 进行每日签到 | `/群聊签到` |
+| `/补签` | 消耗积分补上最近一个漏签日，不重复发放签到奖励 | `/补签` |
 | `/我的积分` | 查询自己的当前积分 | `/我的积分` |
 | `/积分榜` | 查看当前群积分排行 | `/积分榜` |
 | `/积分规则` | 查看当前积分获取规则 | `/积分规则` |
@@ -150,6 +153,7 @@
 | `/兑换设精` | 引用消息后兑换设精 | `回复一条消息后发送 /兑换设精` |
 | `/兑换禁言` | 兑换自禁言 | `/兑换禁言` |
 | `/兑换禁言 @某用户` | 兑换禁言他人 | `需先开启 allow_mute_others` |
+| `/偷积分 @某用户` | 按配置概率尝试偷取指定用户的积分 | `需先开启 steal_settings.enabled` |
 | `/抢红包` | 领取当前群最新的积分红包 | `/抢红包` |
 | `/抢红包 口令` | 领取当前群最新的口令红包 | `/抢红包 春日快乐` |
 | `/抢红包 编号 [口令]` | 按编号精确领取，兼容多个红包同时存在 | `/抢红包 A1B2C3D4 春日快乐` |
@@ -162,6 +166,7 @@
 | 口令 | 说明 |
 | :--- | :--- |
 | `<签到关键词>签到` / `签到<签到关键词>` | 无前缀签到 |
+| `<签到关键词>补签` / `补签<签到关键词>` | 无前缀补签 |
 | `<抽奖关键词>抽奖` / `抽奖<抽奖关键词>` | 无前缀抽奖，直接走当前默认抽奖模式 |
 | `<生日签到触发词>` | 无前缀生日签到，效果同 `/生日签到` |
 
@@ -200,6 +205,8 @@
 - `sign_in_settings.streak_step_bonus`：连签每日递增奖励
 - `sign_in_settings.streak_bonus_cap`：连签奖励上限
 - `sign_in_settings.weekly_streak_bonus`：每连续 7 天额外奖励
+- `sign_in_settings.make_up_cost`：补签每次消耗的积分，填 `0` 表示免费
+- `sign_in_settings.make_up_monthly_limit`：每个用户每月补签次数上限，填 `0` 表示不限次数
 - `sign_in_settings.fortune_event_enabled`：是否开启欧皇 / 非酋彩蛋
 - `sign_in_settings.fortune_event_chance`：彩蛋触发概率
 - `sign_in_settings.fortune_event_points`：彩蛋积分变化值
@@ -228,6 +235,15 @@
 - `activity_settings.daily_limit`：每日奖励次数上限
 - `activity_settings.min_text_length`：最短消息长度限制
 
+### 偷积分配置
+- `steal_settings.enabled`：是否开启偷积分功能，默认关闭
+- `steal_settings.daily_steal_limit`：每人每日发起偷积分次数，填 `0` 表示不限
+- `steal_settings.daily_be_stolen_limit`：每人每日被成功偷取次数，填 `0` 表示不限
+- `steal_settings.min_points` / `max_points`：成功时随机偷取的积分范围，实际不会超过被偷者余额
+- `steal_settings.success_probability`：成功概率，填写 `0` 到 `1` 的小数
+- `steal_settings.failure_cost`：失败时扣除发起者的积分，填 `0` 表示不扣
+- `steal_settings.failure_cost_to_victim`：失败扣除是否转给被偷者
+
 ### 抽奖配置
 - `lottery_settings.enabled`：总开关
 - `lottery_settings.default_mode`：默认抽奖模式，支持 `personal` 和 `group`
@@ -241,11 +257,14 @@
 - `lottery_settings.group_distribution_ratios`：群体奖池分配比例
 
 ### 兑换配置
-- `exchange_items`：自定义兑换物列表；每项可设置 `name`、`enabled`、`cost`、`contents`、`private_only` 和 `success_template`
+- `exchange_items`：自定义兑换物列表；每项可设置 `name`、`enabled`、`cost`、`content_type`、`contents`、`selection_mode`、`repeatable`、`private_only` 和 `success_template`
+- `exchange_items.*.content_type`：`text` 文本、`image` 图片或 `video` 视频；管理页会先选择类型，再显示对应的内容管理界面
 - `exchange_items.*.name`：用户可见且用于 `/兑换 名称` 的自定义兑换物名称；支持完整名称或唯一片段匹配
 - `exchange_items.*.enabled`：控制该兑换物是否出现在列表中；可先关闭并编辑草稿，准备好后再开启
 - `exchange_items.*.cost`：每次兑换扣除的积分
-- `exchange_items.*.contents`：待发放内容列表，每项是一份一次性库存，可填写兑换码、领取凭证、链接、口令或其他文本
+- `exchange_items.*.contents`：待发放内容列表；普通文本按文字发送，使用 `image:` / `video:` 前缀可发送图片或视频
+- `exchange_items.*.repeatable`：是否允许重复兑换；默认关闭，开启后不消耗内容库存
+- `exchange_items.*.selection_mode`：`sequential` 按序发放，`random` 随机发放
 - `exchange_items.*.private_only`：是否把兑换结果主动私聊给群内发起兑换的用户；关闭后会在发起会话直接发送
 - `exchange_items.*.success_template`：成功提示，支持 `{item}`、`{content}`、`{cost}`、`{points_name}`、`{remaining}`
 - `exchange_scope.mode`：自定义兑换物范围模式，`blacklist`（默认）排除列表中的群或账号，`whitelist` 只允许列表中的群或账号
@@ -304,7 +323,7 @@
 ---
 
 ## 注意事项
-1. 兑换头衔、兑换设精、兑换禁言、负分头衔同步依赖 QQ / AIOCQHTTP 能力，其他平台可能无法生效
+1. 兑换头衔、兑换设精、兑换禁言、负分头衔同步依赖 QQ / AIOCQHTTP 能力；负分头衔还通常需要 Bot 具备群主权限，权限不足时只跳过头衔展示，不影响积分功能
 2. 机器人若没有对应群管理权限，兑换操作会失败；涉及先扣后调接口的场景会自动退款
 3. 群内私聊发放在 QQ / AIOCQHTTP 上可直接调用私聊接口；其他平台需要用户先与 Bot 建立一次真实私聊会话，插件记录该会话后才能从群里发放
 4. 群体抽奖若当天未凑齐开奖人数，会在次日首次触发群体抽奖时自动退款
@@ -326,6 +345,10 @@
 ---
 
 ## 更新记录
+
+### 2.4.0
+- 新增可选偷积分玩法：支持每日发起次数、每日被偷次数、随机偷取范围、成功概率、失败扣除及失败积分转让配置
+- 新增 `/偷积分 @用户` 和 `/偷积分 QQ号` 命令，数据迁移版本升级至 13
 
 ### 2.3.1
 - 兼容命令末尾附加的 `[MSG_ID:数字]` 消息标记，修复 AstrBot 4.23.6 环境下 `/给积分` 与 `/兑换` 参数解析失败的问题
@@ -411,7 +434,7 @@
 ### 1.7.0
 - 支持负分
 - 负分用户限制为仅可签到恢复积分
-- 自动同步 `群女仆X号` 头衔
+- 尽力同步 `群女仆X号` 头衔，权限不足时不影响负分用户签到恢复积分
 
 ### 1.6.x
 - 增加每日首签奖励和 `04:00` 刷新
