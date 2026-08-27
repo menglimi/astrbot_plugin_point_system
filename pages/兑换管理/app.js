@@ -59,7 +59,8 @@
     { id: "steal", label: "偷积分玩法", icon: "hand-coins", description: "控制群内偷积分的次数、范围、概率和失败惩罚。", fields: [
       { path: "steal_settings.enabled", label: "启用偷积分", hint: "允许成员使用 /偷积分 @用户", type: "boolean" },
       { path: "steal_settings.daily_steal_limit", label: "每日可偷次数", hint: "填 0 表示不限次数", type: "number", min: 0 },
-      { path: "steal_settings.daily_be_stolen_limit", label: "每日可被偷次数", hint: "按成功被偷次数计算，填 0 表示不限", type: "number", min: 0 },
+      { path: "steal_settings.daily_be_stolen_limit", label: "每日可被偷次数", hint: "填 0 表示不限次数", type: "number", min: 0 },
+      { path: "steal_settings.failure_counts_as_stolen", label: "失败计入被偷次数", hint: "开启后，偷取失败也会消耗被偷者当天的次数", type: "boolean" },
       { path: "steal_settings.min_points", label: "偷取积分下限", hint: "成功时随机获得的最少积分", type: "number", min: 1 },
       { path: "steal_settings.max_points", label: "偷取积分上限", hint: "成功时随机获得的最多积分", type: "number", min: 1 },
       { path: "steal_settings.success_probability", label: "偷取成功概率", hint: "0 到 1，例如 0.5 表示 50%", type: "number", min: 0, max: 1, step: 0.01 },

@@ -198,8 +198,14 @@
       "daily_be_stolen_limit": {
         "description": "每人每日可被偷次数",
         "type": "int",
-        "hint": "单个用户每天最多被成功偷取多少次；填 0 表示不限次数。",
+        "hint": "单个用户每天最多计入多少次被偷；填 0 表示不限次数。",
         "default": 3
+      },
+      "failure_counts_as_stolen": {
+        "description": "偷取失败是否计入被偷次数",
+        "type": "bool",
+        "hint": "开启后，偷取失败也会消耗被偷者当天的被偷次数；默认关闭。",
+        "default": false
       },
       "min_points": {
         "description": "偷取积分下限",

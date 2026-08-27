@@ -238,7 +238,8 @@
 ### 偷积分配置
 - `steal_settings.enabled`：是否开启偷积分功能，默认关闭
 - `steal_settings.daily_steal_limit`：每人每日发起偷积分次数，填 `0` 表示不限
-- `steal_settings.daily_be_stolen_limit`：每人每日被成功偷取次数，填 `0` 表示不限
+- `steal_settings.daily_be_stolen_limit`：每人每日计入被偷次数，填 `0` 表示不限
+- `steal_settings.failure_counts_as_stolen`：偷取失败是否计入被偷次数，默认关闭
 - `steal_settings.min_points` / `max_points`：成功时随机偷取的积分范围，实际不会超过被偷者余额
 - `steal_settings.success_probability`：成功概率，填写 `0` 到 `1` 的小数
 - `steal_settings.failure_cost`：失败时扣除发起者的积分，填 `0` 表示不扣

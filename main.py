@@ -1775,6 +1775,9 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             "daily_be_stolen_limit": self._normalize_int(
                 steal_cfg.get("daily_be_stolen_limit"), 3, minimum=0
             ),
+            "failure_counts_as_stolen": bool(
+                steal_cfg.get("failure_counts_as_stolen", False)
+            ),
             "min_points": min_points,
             "max_points": max_points,
             "success_probability": min(
@@ -3305,22 +3308,18 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 amount = min(amount, victim["points"])
                 sender["points"] += amount
                 victim["points"] -= amount
-                victim["daily_stolen_points_times"] = victim_times_before + 1
                 result_text = (
-                    f"{reply_name}出手成功，从用户 {target_uid} 那里偷到 {amount} {points_name}！"
-                    f"你现在有 {sender['points']} {points_name}。"
+                    f"成功偷取 {target_uid} {amount} {points_name}。"
                 )
             else:
                 cost = settings["failure_cost"]
                 sender["points"] -= cost
                 if settings["failure_cost_to_victim"] and cost > 0:
                     victim["points"] += cost
-                result_text = f"{reply_name}偷积分失败。"
-                if cost > 0:
-                    result_text += f"扣除 {cost} {points_name}"
-                    if settings["failure_cost_to_victim"]:
-                        result_text += f"，已转给被偷者"
-                    result_text += f"，你现在有 {sender['points']} {points_name}。"
+                result_text = f"偷取失败，扣除 {cost} {points_name}。"
+
+            if success or settings["failure_counts_as_stolen"]:
+                victim["daily_stolen_points_times"] = victim_times_before + 1
 
             save_ok = await self._save_data_locked()
             if save_ok is False:
@@ -3486,14 +3485,20 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 else "每天不限次数"
             )
             be_stolen_limit_text = (
-                f"每人每天最多被成功偷 {steal_cfg['daily_be_stolen_limit']} 次"
+                f"每人每天最多计入被偷 {steal_cfg['daily_be_stolen_limit']} 次"
                 if steal_cfg["daily_be_stolen_limit"] > 0
                 else "每人每天被偷次数不限"
+            )
+            failure_count_text = (
+                "，偷取失败也计入被偷次数"
+                if steal_cfg["failure_counts_as_stolen"]
+                else "，偷取失败不计入被偷次数"
             )
             lines.append(
                 f"9. 偷积分：{steal_limit_text}，{be_stolen_limit_text}，"
                 f"成功率 {steal_cfg['success_probability'] * 100:.1f}%，"
                 f"成功随机获得 {steal_cfg['min_points']}~{steal_cfg['max_points']} {points_name}"
+                f"{failure_count_text}"
             )
         else:
             lines.append("9. 偷积分：当前未开启")

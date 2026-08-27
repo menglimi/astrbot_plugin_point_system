@@ -54,6 +54,7 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
         "enabled": False,
         "daily_steal_limit": 3,
         "daily_be_stolen_limit": 3,
+        "failure_counts_as_stolen": False,
         "min_points": 1,
         "max_points": 20,
         "success_probability": 0.5,
