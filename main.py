@@ -1659,6 +1659,9 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             else self._get_lottery_trigger_keyword()
         )
         variants: list[str] = []
+        # “签到”是最常见的无前缀用法，即使未配置关键词也应保持可用。
+        if action_word == "签到":
+            self._append_unique_trigger(variants, "签到")
         self._append_trigger_keyword_variants(variants, keyword, action_word)
 
         if action_word == "签到":
@@ -2429,9 +2432,25 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             return False
 
     def _get_command_args(self, event: AstrMessageEvent) -> str:
-        raw_message = event.message_str or self._get_event_plain_text(event)
-        _, args = self._split_command_text(raw_message)
-        return args
+        candidates = [
+            getattr(event, "message_str", ""),
+            getattr(getattr(event, "message_obj", None), "message_str", ""),
+            self._get_event_plain_text(event),
+        ]
+        fallback = ""
+        for raw_message in candidates:
+            normalized = self._normalize_command_text(raw_message)
+            if not normalized:
+                continue
+            if not fallback:
+                fallback = normalized
+            command_name, args = self._split_command_text(normalized)
+            if args:
+                return args
+            if command_name in REGISTERED_COMMAND_NAMES:
+                return ""
+        # 某些适配器会把已匹配的命令从 message_str 中剥离，只留下参数。
+        return fallback
 
     def _get_command_name(self, event: AstrMessageEvent) -> str:
         command_name, _ = self._split_command_text(event.message_str or "")
