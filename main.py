@@ -78,6 +78,7 @@ REGISTERED_COMMAND_NAMES = (
     "兑换",
     "记录生日",
     "生日签到",
+    "签到",
     "群聊签到",
     "补签",
     "我的积分",
@@ -111,6 +112,9 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         self.config = config
         self._data_lock = asyncio.Lock()
         self._backup_task: asyncio.Task | None = None
+        self._deferred_save_task: asyncio.Task | None = None
+        self._deferred_save_generation = 0
+        self._deferred_save_stop_requested = False
         self._backup_stop_event = asyncio.Event()
         self._birthday_broadcast_task: asyncio.Task | None = None
         self._birthday_broadcast_stop_event = asyncio.Event()
@@ -1335,6 +1339,20 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 except OSError:
                     pass
 
+    def _write_serialized_sync(self, payload: str) -> None:
+        """将已在锁内生成的快照写入磁盘，避免写文件期间占用数据锁。"""
+        temp_file = f"{self.data_file}.tmp"
+        try:
+            with open(temp_file, "w", encoding="utf-8") as file:
+                file.write(payload)
+            os.replace(temp_file, self.data_file)
+        finally:
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except OSError:
+                    pass
+
     async def _save_data_locked(self) -> bool:
         previous_snapshots = self.data.get("point_snapshots")
         had_snapshots = "point_snapshots" in self.data
@@ -1349,6 +1367,45 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 self.data.pop("point_snapshots", None)
             logger.error(f"保存积分数据失败: {exc}")
             return False
+
+    def _schedule_deferred_save(self, delay: float = 0.15) -> None:
+        """合并短时间内的多次变更，避免高频玩法反复写完整数据文件。"""
+        self._deferred_save_generation += 1
+        task = getattr(self, "_deferred_save_task", None)
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._deferred_save_task = loop.create_task(
+            self._deferred_save_loop(delay)
+        )
+
+    async def _deferred_save_loop(self, delay: float) -> None:
+        saved_generation = self._deferred_save_generation
+        try:
+            await asyncio.sleep(max(delay, 0.0))
+            saved_generation = self._deferred_save_generation
+            async with self._data_lock:
+                self._record_point_snapshot()
+                payload = json.dumps(
+                    self.data, ensure_ascii=False, indent=2, sort_keys=True
+                )
+            await asyncio.to_thread(self._write_serialized_sync, payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"延迟保存积分数据失败: {exc}")
+            # 保存失败时强制保留待保存代数，稍后自动重试，避免静默丢失。
+            saved_generation = -1
+        finally:
+            self._deferred_save_task = None
+            if (
+                not self._deferred_save_stop_requested
+                and self._deferred_save_generation > saved_generation
+            ):
+                self._schedule_deferred_save(delay)
 
     def _build_backup_file_path(self, backup_path: str) -> str:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2372,7 +2429,8 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             return False
 
     def _get_command_args(self, event: AstrMessageEvent) -> str:
-        _, args = self._split_command_text(event.message_str or "")
+        raw_message = event.message_str or self._get_event_plain_text(event)
+        _, args = self._split_command_text(raw_message)
         return args
 
     def _get_command_name(self, event: AstrMessageEvent) -> str:
@@ -2735,7 +2793,8 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             if retry_after_map is not None:
                 for group_id, _, _ in successful_updates:
                     retry_after_map.pop(group_id, None)
-            await self._save_data_locked()
+            # 签到属于高频操作，数据已在锁内更新，交给合并保存任务落盘。
+            self._schedule_deferred_save()
 
     async def _clear_negative_titles_before_reset(self, event: AstrMessageEvent) -> int:
         if not isinstance(event, AiocqhttpMessageEvent):
@@ -3051,7 +3110,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             if not user_info["first_sign_in_at"]:
                 user_info["first_sign_in_at"] = today
 
-            await self._save_data_locked()
+            self._schedule_deferred_save()
 
             total_points = user_info["points"]
             streak = user_info["streak"]
@@ -3197,7 +3256,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 )
                 user_info["last_sign_in"] = target
 
-            await self._save_data_locked()
+            self._schedule_deferred_save()
             remaining_points = user_info["points"]
             streak = user_info["streak"]
             used_count = user_info["make_up_sign_in_count"]
@@ -3288,11 +3347,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 return
 
             sender_before = sender["points"]
-            victim_before = victim["points"]
-            sender_times_before = used_times
             victim_times_before = stolen_times
-            sender_date_before = sender.get("steal_points_date", "")
-            victim_date_before = victim.get("stolen_points_date", "")
             sender["daily_steal_points_times"] = used_times + 1
             sender["steal_points_date"] = today
             victim["stolen_points_date"] = today
@@ -3321,25 +3376,24 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             if success or settings["failure_counts_as_stolen"]:
                 victim["daily_stolen_points_times"] = victim_times_before + 1
 
-            save_ok = await self._save_data_locked()
-            if save_ok is False:
-                sender["points"] = sender_before
-                victim["points"] = victim_before
-                sender["daily_steal_points_times"] = sender_times_before
-                victim["daily_stolen_points_times"] = victim_times_before
-                sender["steal_points_date"] = sender_date_before
-                victim["stolen_points_date"] = victim_date_before
-                yield self._plain_result(
-                    event, "偷积分记录保存失败，本次操作未生效，请稍后再试。"
-                )
-                return
+            self._schedule_deferred_save()
 
-        await self._refresh_negative_titles_for_user(event, sender_id)
+        # 仅在余额跨过 0 时同步负分头衔，避免每次偷积分都触发额外群接口调用。
+        if (sender_before < 0 <= sender["points"]) or (
+            sender_before >= 0 > sender["points"]
+        ):
+            await self._refresh_negative_titles_for_user(event, sender_id)
         yield self._plain_result(event, result_text)
 
     @filter.command("群聊签到")
     async def sign_in(self, event: AstrMessageEvent):
         """每日签到以获取积分奖励。"""
+        async for result in self._handle_sign_in(event):
+            yield result
+
+    @filter.command("签到")
+    async def sign_in_alias(self, event: AstrMessageEvent):
+        """兼容用户最常用的 /签到 命令。"""
         async for result in self._handle_sign_in(event):
             yield result
 
@@ -3588,6 +3642,15 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 yield result.stop_event()
             return
 
+        # 带前缀命令由对应 handler 处理，生日触发词除外，避免通用处理器重复保存。
+        birthday_sign_in_message = await self._try_birthday_sign_in(event, message)
+        if birthday_sign_in_message is not None:
+            event.stop_event()
+            yield self._plain_result(event, birthday_sign_in_message).stop_event()
+            return
+        if self._is_command_like_message(message):
+            return
+
         user_id = str(event.get_sender_id())
         async with self._data_lock:
             user_info = self._get_user_record(user_id)
@@ -3597,12 +3660,6 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             is_negative_user = user_info["points"] < 0
             if group_member_changed:
                 await self._save_data_locked()
-
-        birthday_sign_in_message = await self._try_birthday_sign_in(event, message)
-        if birthday_sign_in_message is not None:
-            event.stop_event()
-            yield self._plain_result(event, birthday_sign_in_message).stop_event()
-            return
 
         if is_negative_user:
             return
@@ -3622,7 +3679,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         if not group_id:
             return
 
-        if not message or self._is_command_like_message(message):
+        if not message:
             return
 
         if len(message) < activity_cfg["min_text_length"]:
@@ -4613,6 +4670,13 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             self._birthday_broadcast_task.cancel()
             try:
                 await self._birthday_broadcast_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._deferred_save_task is not None:
+            self._deferred_save_stop_requested = True
+            try:
+                await self._deferred_save_task
             except asyncio.CancelledError:
                 pass
 

@@ -101,12 +101,12 @@ class BirthdayFeatureMixin:
                 auto_recorded = True
             elif not birthday_md:
                 if group_member_changed:
-                    await self._save_data_locked()
+                    self._schedule_deferred_save()
                 return f"{reply_name}还没有记录生日，请先使用 /记录生日 mm/dd。"
 
             if birthday_md != today_md:
                 if group_member_changed:
-                    await self._save_data_locked()
+                    self._schedule_deferred_save()
                 return (
                     f"{reply_name}记录的生日是 {birthday_md}，今天还不是你的生日，"
                     "先把祝福留到当天吧。"
@@ -114,13 +114,13 @@ class BirthdayFeatureMixin:
 
             if user_info.get("last_birthday_sign_in_year") == current_year:
                 if group_member_changed:
-                    await self._save_data_locked()
+                    self._schedule_deferred_save()
                 return f"{reply_name}今年的生日签到奖励已经领过啦，明年再来吧。"
 
             user_info["points"] += reward_points
             user_info["last_birthday_sign_in_year"] = current_year
             total_points = user_info["points"]
-            await self._save_data_locked()
+            self._schedule_deferred_save()
 
         await self._refresh_negative_titles_for_user(event, user_id)
 
@@ -267,7 +267,7 @@ class BirthdayFeatureMixin:
                 group_info = groups.get(group_id)
                 if isinstance(group_info, dict):
                     group_info["last_birthday_broadcast_date"] = today_iso
-            await self._save_data_locked()
+            self._schedule_deferred_save()
 
     async def birthday_sign_in(self, event: AstrMessageEvent):
         """领取生日签到奖励；未记录生日时会自动记录为今天。"""
@@ -300,6 +300,6 @@ class BirthdayFeatureMixin:
             user_info = self._get_user_record(user_id)
             self._touch_group_member(event, user_id, self._get_sender_display_name(event))
             user_info["birthday_md"] = birthday_md
-            await self._save_data_locked()
+            self._schedule_deferred_save()
 
         yield self._plain_result(event, f"{reply_name}的生日已记录为 {birthday_md}。")
