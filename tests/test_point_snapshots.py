@@ -67,6 +67,27 @@ class PointSnapshotTests(unittest.TestCase):
         self.assertFalse(saved)
         self.assertIs(self.plugin.data["point_snapshots"], previous)
 
+    def test_deferred_save_coalesces_repeated_requests(self):
+        writes = []
+        self.plugin.data_file = "unused-in-test.json"
+        self.plugin._data_lock = asyncio.Lock()
+        self.plugin._deferred_save_task = None
+        self.plugin._deferred_save_generation = 0
+        self.plugin._deferred_save_stop_requested = False
+        self.plugin._write_serialized_sync = writes.append
+
+        async def run():
+            self.plugin._schedule_deferred_save(0.01)
+            task = self.plugin._deferred_save_task
+            self.plugin._schedule_deferred_save(0.01)
+            self.plugin._schedule_deferred_save(0.01)
+            await task
+
+        asyncio.run(run())
+
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(self.plugin._deferred_save_generation, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

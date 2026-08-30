@@ -103,7 +103,7 @@ REGISTERED_COMMAND_NAMES_BY_LENGTH = tuple(
     PLUGIN_NAME,
     "menglimi",
     "astrbot_plugin_point_system 是一个面向 AstrBot 群聊场景的积分互动插件，围绕“签到、活跃、抽奖、兑换、管理”这几类高频玩法设计。它支持按群维护成员信息、自动保存数据、定时备份、日期口令奖励，以及负分限制和群头衔联动，适合做群活跃体系或轻量积分经济。",
-    "2.4.0",
+    "2.4.1",
     "https://github.com/menglimi/astrbot_plugin_point_system",
 )
 class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
@@ -111,6 +111,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         super().__init__(context)
         self.config = config
         self._data_lock = asyncio.Lock()
+        self._persistence_lock = asyncio.Lock()
         self._backup_task: asyncio.Task | None = None
         self._deferred_save_task: asyncio.Task | None = None
         self._deferred_save_generation = 0
@@ -1330,7 +1331,12 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         temp_file = f"{self.data_file}.tmp"
         try:
             with open(temp_file, "w", encoding="utf-8") as file:
-                json.dump(self.data, file, ensure_ascii=False, indent=2, sort_keys=True)
+                json.dump(
+                    self.data,
+                    file,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
             os.replace(temp_file, self.data_file)
         finally:
             if os.path.exists(temp_file):
@@ -1354,11 +1360,20 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                     pass
 
     async def _save_data_locked(self) -> bool:
+        # 即时保存会使正在等待写盘的延迟快照失效，避免旧快照覆盖新数据。
+        self._deferred_save_generation = getattr(
+            self, "_deferred_save_generation", 0
+        ) + 1
         previous_snapshots = self.data.get("point_snapshots")
         had_snapshots = "point_snapshots" in self.data
         self._record_point_snapshot()
         try:
-            await asyncio.to_thread(self._write_data_sync)
+            persistence_lock = getattr(self, "_persistence_lock", None)
+            if persistence_lock is None:
+                persistence_lock = asyncio.Lock()
+                self._persistence_lock = persistence_lock
+            async with persistence_lock:
+                await asyncio.to_thread(self._write_data_sync)
             return True
         except Exception as exc:
             if had_snapshots:
@@ -1368,9 +1383,12 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             logger.error(f"保存积分数据失败: {exc}")
             return False
 
-    def _schedule_deferred_save(self, delay: float = 0.15) -> None:
+    def _schedule_deferred_save(self, delay: float = 0.5) -> None:
         """合并短时间内的多次变更，避免高频玩法反复写完整数据文件。"""
-        self._deferred_save_generation += 1
+        # 兼容测试桩或旧版热重载对象未经过完整 __init__ 的情况。
+        self._deferred_save_generation = getattr(
+            self, "_deferred_save_generation", 0
+        ) + 1
         task = getattr(self, "_deferred_save_task", None)
         if task is not None and not task.done():
             return
@@ -1378,21 +1396,33 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        if not getattr(self, "data_file", None):
+            return
         self._deferred_save_task = loop.create_task(
             self._deferred_save_loop(delay)
         )
 
     async def _deferred_save_loop(self, delay: float) -> None:
-        saved_generation = self._deferred_save_generation
+        saved_generation = getattr(self, "_deferred_save_generation", 0)
         try:
             await asyncio.sleep(max(delay, 0.0))
-            saved_generation = self._deferred_save_generation
+            saved_generation = getattr(self, "_deferred_save_generation", 0)
             async with self._data_lock:
                 self._record_point_snapshot()
                 payload = json.dumps(
-                    self.data, ensure_ascii=False, indent=2, sort_keys=True
+                    self.data,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
                 )
-            await asyncio.to_thread(self._write_serialized_sync, payload)
+            persistence_lock = getattr(self, "_persistence_lock", None)
+            if persistence_lock is None:
+                persistence_lock = asyncio.Lock()
+                self._persistence_lock = persistence_lock
+            async with persistence_lock:
+                # 即时保存或新一轮变更已经出现时，放弃这份旧快照并重排任务。
+                if getattr(self, "_deferred_save_generation", 0) != saved_generation:
+                    return
+                await asyncio.to_thread(self._write_serialized_sync, payload)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1402,7 +1432,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
         finally:
             self._deferred_save_task = None
             if (
-                not self._deferred_save_stop_requested
+                not getattr(self, "_deferred_save_stop_requested", False)
                 and self._deferred_save_generation > saved_generation
             ):
                 self._schedule_deferred_save(delay)
@@ -3677,8 +3707,10 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
                 event, user_id, self._get_sender_display_name(event)
             )
             is_negative_user = user_info["points"] < 0
+            # 普通消息是最高频入口；成员展示名/消息目标变更与活跃积分一起合并落盘，
+            # 避免每条消息都序列化并替换整个 JSON 文件。
             if group_member_changed:
-                await self._save_data_locked()
+                self._schedule_deferred_save()
 
         if is_negative_user:
             return
@@ -3726,7 +3758,7 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
 
             if daily_times >= activity_cfg["daily_limit"] or within_cooldown:
                 if group_member_changed:
-                    await self._save_data_locked()
+                    self._schedule_deferred_save()
                 return
 
             user_info["points"] += activity_cfg["points_per_message"]
@@ -3734,7 +3766,8 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             user_info["last_active_reward_at"] = now.isoformat(timespec="seconds")
             user_info["last_active_reward_date"] = today
             user_info["daily_active_point_times"] = daily_times + 1
-            await self._save_data_locked()
+            # 活跃奖励允许短暂延迟持久化，多个高频消息共享一次写盘任务。
+            self._schedule_deferred_save()
 
     @filter.command("积分榜")
     async def leaderboard(self, event: AstrMessageEvent):
