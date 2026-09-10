@@ -103,7 +103,7 @@ REGISTERED_COMMAND_NAMES_BY_LENGTH = tuple(
     PLUGIN_NAME,
     "menglimi",
     "astrbot_plugin_point_system 是一个面向 AstrBot 群聊场景的积分互动插件，围绕“签到、活跃、抽奖、兑换、管理”这几类高频玩法设计。它支持按群维护成员信息、自动保存数据、定时备份、日期口令奖励，以及负分限制和群头衔联动，适合做群活跃体系或轻量积分经济。",
-    "2.4.1",
+    "2.4.2",
     "https://github.com/menglimi/astrbot_plugin_point_system",
 )
 class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
@@ -2345,12 +2345,30 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
     ) -> str:
         return self._get_sign_in_business_date(now).isoformat()
 
+    def _get_event_self_id(self, event: AstrMessageEvent) -> str:
+        getter = getattr(event, "get_self_id", None)
+        self_id = (
+            getter()
+            if callable(getter)
+            else getattr(getattr(event, "message_obj", None), "self_id", "")
+        )
+        return self._normalize_user_id(self_id) if self_id else ""
+
+    def _get_bot_display_name(self, user_id: str) -> str:
+        return f"机器人（{user_id}）"
+
     def _get_sender_display_name(self, event: AstrMessageEvent) -> str:
         sender_id = str(event.get_sender_id())
+        if sender_id and sender_id == self._get_event_self_id(event):
+            # 代理执行可能只替换发送者 ID，昵称仍属于发起人。
+            return self._get_bot_display_name(sender_id)
         sender_name = getattr(event, "get_sender_name", lambda: None)()
         return self._safe_display_name(sender_name, sender_id)
 
     def _get_sender_reply_name(self, event: AstrMessageEvent) -> str:
+        sender_id = str(event.get_sender_id())
+        if sender_id and sender_id == self._get_event_self_id(event):
+            return self._get_bot_display_name(sender_id)
         sender_name = getattr(event, "get_sender_name", lambda: None)()
         return self._safe_reply_name(sender_name)
 
@@ -2388,8 +2406,22 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             changed = True
         members = group_info.setdefault("members", {})
 
-        safe_name = self._safe_display_name(display_name, user_id)
         timestamp = datetime.datetime.now().isoformat(timespec="seconds")
+        self_id = self._get_event_self_id(event)
+        bot_member = members.get(self_id) if self_id else None
+        if isinstance(bot_member, dict):
+            bot_name = self._get_bot_display_name(self_id)
+            if bot_member.get("display_name") != bot_name:
+                # 群内普通消息也能修复历史代理执行留下的机器人昵称错绑。
+                bot_member["display_name"] = bot_name
+                bot_member["updated_at"] = timestamp
+                changed = True
+
+        safe_name = (
+            self._get_bot_display_name(self_id)
+            if self_id and user_id == self_id
+            else self._safe_display_name(display_name, user_id)
+        )
         current_member = members.get(user_id)
         current_display_name = (
             current_member.get("display_name")
@@ -3771,11 +3803,15 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
 
     @filter.command("积分榜")
     async def leaderboard(self, event: AstrMessageEvent):
-        """查看本群积分排名前列的群友。"""
+        """仅查看当前群积分排名前列的群友。"""
         points_name = self._get_points_name()
         limit, show_self_rank = self._get_leaderboard_settings()
         sender_id = str(event.get_sender_id())
         group_id = self._get_group_id(event)
+
+        if not group_id:
+            yield self._plain_result(event, "积分榜仅支持群聊中使用，只展示当前群成员。")
+            return
 
         async with self._data_lock:
             group_member_changed = self._touch_group_member(
@@ -3784,22 +3820,8 @@ class PointSystemPlugin(BirthdayFeatureMixin, LotteryFeatureMixin, Star):
             if group_member_changed:
                 await self._save_data_locked()
 
-            if group_id:
-                rankings = self._get_group_rankings(group_id)
-                title = f"🏆 【本群{points_name}排行榜】 🏆"
-                fallback_to_global = not rankings
-            else:
-                rankings = []
-                title = f"🏆 【{points_name}总排行榜】 🏆"
-                fallback_to_global = True
-
-            if fallback_to_global:
-                rankings = self._get_global_rankings()
-                if group_id:
-                    title = (
-                        f"🏆 【本群{points_name}排行榜】 🏆。"
-                        "当前群聊还没有独立排行数据，先展示全局排行。"
-                    )
+            rankings = self._get_group_rankings(group_id)
+            title = f"🏆 【本群{points_name}排行榜】 🏆"
 
         lines = [title]
         sender_rank = -1
