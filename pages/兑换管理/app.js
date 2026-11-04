@@ -7,6 +7,12 @@
   let saveStateTimer = 0;
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
+  // 可选控件绑定：节点不存在时静默跳过，避免单个控件缺失中断整个初始化流程。
+  const on = (selector, event, handler) => {
+    const node = $(selector);
+    if (node) node.addEventListener(event, handler);
+    return node;
+  };
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]);
   const uniqueLines = (value) => {
     const values = Array.isArray(value)
@@ -476,9 +482,12 @@
     $("#itemCost").value = item.cost || 1;
     $("#itemEnabled").checked = Boolean(item.enabled);
     $("#itemPrivate").checked = Boolean(item.private_only);
-    $("#itemContentType").value = ["text", "image", "video"].includes(item.content_type) ? item.content_type : "text";
-    $("#itemRepeatable").checked = Boolean(item.repeatable);
-    $("#itemSelectionMode").value = item.selection_mode === "random" ? "random" : "sequential";
+    const contentTypeControl = $("#itemContentType");
+    if (contentTypeControl) contentTypeControl.value = ["text", "image", "video"].includes(item.content_type) ? item.content_type : "text";
+    const repeatableControl = $("#itemRepeatable");
+    if (repeatableControl) repeatableControl.checked = Boolean(item.repeatable);
+    const selectionModeControl = $("#itemSelectionMode");
+    if (selectionModeControl) selectionModeControl.value = item.selection_mode === "random" ? "random" : "sequential";
     $("#itemContents").value = (item.contents || []).join("\n");
     $("#successTemplate").value = item.success_template || DEFAULT_TEMPLATE;
     $("#pointsNameSuffix").textContent = state.data?.points_name || "积分";
@@ -592,15 +601,20 @@
 
   function updateContentEditor() {
     const item = state.draft[state.selected];
-    if (!item) return;
+    const textEditor = $("#textContentEditor");
+    const mediaEditor = $("#mediaContentEditor");
+    // 内容类型与媒体控件暂未在页面中提供，缺失时保持文本内容编辑可用。
+    if (!item || !(textEditor && mediaEditor)) return;
     const type = ["text", "image", "video"].includes(item.content_type) ? item.content_type : "text";
     const isMedia = type !== "text";
-    $("#textContentEditor").hidden = isMedia;
-    $("#mediaContentEditor").hidden = !isMedia;
-    $("#contentUploadInput").accept = type === "image" ? "image/*" : "video/*";
-    $("#uploadMediaButton").innerHTML = `<i data-lucide="upload"></i>上传${type === "image" ? "图片" : "视频"}`;
+    textEditor.hidden = isMedia;
+    mediaEditor.hidden = !isMedia;
+    const uploadInput = $("#contentUploadInput");
+    if (uploadInput) uploadInput.accept = type === "image" ? "image/*" : "video/*";
+    const uploadButton = $("#uploadMediaButton");
+    if (uploadButton) uploadButton.innerHTML = `<i data-lucide="upload"></i>上传${type === "image" ? "图片" : "视频"}`;
     const list = $("#mediaContentList");
-    if (isMedia) {
+    if (isMedia && list) {
       list.innerHTML = (item.contents || []).map((content, index) => {
         const source = String(content || "").replace(/^(image|video):/i, "");
         const filename = source.split(/[\\/]/).pop() || `媒体 ${index + 1}`;
@@ -615,6 +629,7 @@
     if (!item || !files.length) return;
     const button = $("#uploadMediaButton");
     const input = $("#contentUploadInput");
+    if (!(button && input)) return;
     button.disabled = true;
     button.classList.add("loading");
     try {
@@ -982,7 +997,7 @@
     $("#itemCost").addEventListener("input", (event) => { clearValidation(); updateSelected("cost", Number(event.target.value || 0)); renderTemplatePreview(); });
     $("#itemEnabled").addEventListener("change", (event) => updateSelected("enabled", event.target.checked));
     $("#itemPrivate").addEventListener("change", (event) => updateSelected("private_only", event.target.checked));
-    $("#itemContentType").addEventListener("change", (event) => {
+    on("#itemContentType", "change", (event) => {
       const item = state.draft[state.selected];
       const nextType = event.target.value;
       if (item && item.contents?.length && nextType !== item.content_type) {
@@ -999,10 +1014,10 @@
       updateContentEditor();
       renderEditor();
     });
-    $("#itemRepeatable").addEventListener("change", (event) => { updateSelected("repeatable", event.target.checked); updateStockEditor(); renderItemList(); });
-    $("#itemSelectionMode").addEventListener("change", (event) => { updateSelected("selection_mode", event.target.value === "random" ? "random" : "sequential"); renderItemList(); });
+    on("#itemRepeatable", "change", (event) => { updateSelected("repeatable", event.target.checked); updateStockEditor(); renderItemList(); });
+    on("#itemSelectionMode", "change", (event) => { updateSelected("selection_mode", event.target.value === "random" ? "random" : "sequential"); renderItemList(); });
     $("#itemContents").addEventListener("input", (event) => { updateSelected("contents", uniqueLines(event.target.value), false); updateStockEditor(event.target.value); renderTemplatePreview(); });
-    $("#mediaContentList").addEventListener("click", (event) => {
+    on("#mediaContentList", "click", (event) => {
       const button = event.target.closest("[data-remove-media]");
       if (!button) return;
       const item = state.draft[state.selected];
@@ -1011,8 +1026,8 @@
       setDirty();
       renderEditor();
     });
-    $("#uploadMediaButton").addEventListener("click", () => $("#contentUploadInput").click());
-    $("#contentUploadInput").addEventListener("change", (event) => uploadMedia([...event.target.files]));
+    on("#uploadMediaButton", "click", () => $("#contentUploadInput")?.click());
+    on("#contentUploadInput", "change", (event) => uploadMedia([...event.target.files]));
     $("#cleanContentsButton").addEventListener("click", normalizeContents);
     $("#successTemplate").addEventListener("input", (event) => { updateSelected("success_template", event.target.value, false); renderTemplatePreview(); });
     $("#resetTemplateButton").addEventListener("click", () => { $("#successTemplate").value = DEFAULT_TEMPLATE; updateSelected("success_template", DEFAULT_TEMPLATE, false); renderTemplatePreview(); });
@@ -1041,10 +1056,15 @@
     let savedTheme = "system";
     try { savedTheme = window.localStorage?.getItem("point-exchange-theme") || "system"; } catch (_) { /* noop */ }
     applyTheme(savedTheme);
-    bindEvents();
     icons();
     switchPage("overview");
+    // 先取数据再绑定事件：界面控件缺失或绑定异常时，首屏仍要正常发出请求。
     loadData(true);
+    try {
+      bindEvents();
+    } catch (error) {
+      window.console?.error?.("界面事件绑定失败", error);
+    }
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init, { once: true }); else init();
